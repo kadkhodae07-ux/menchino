@@ -1,8 +1,8 @@
-# Menchino Workflow Number: WF-12
-# Signature: MENCHINO-WF12-20260718-R1
-# Supersedes: WF-11
-name: Menchino Android Build WF-12
-run-name: "Menchino WF-12 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
+# Menchino Workflow Number: WF-13
+# Signature: MENCHINO-WF13-20260718-R1
+# Supersedes: WF-12
+name: Menchino Android Build WF-13
+run-name: "Menchino WF-13 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -12,19 +12,19 @@ on:
       - master
     paths:
       - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf12.yml'
+      - '.github/workflows/menchino-build-wf13.yml'
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: menchino-wf12-${{ github.ref }}
+  group: menchino-wf13-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_NUMBER: WF-12
-  WORKFLOW_SIGNATURE: MENCHINO-WF12-20260718-R1
+  WORKFLOW_NUMBER: WF-13
+  WORKFLOW_SIGNATURE: MENCHINO-WF13-20260718-R1
   PROJECT_DIR: .menchino-ci/project
   EXTRACT_DIR: .menchino-ci/extracted
   LOG_DIR: .menchino-ci/logs
@@ -33,7 +33,7 @@ env:
 
 jobs:
   build-android:
-    name: WF-12 build exactly two APKs
+    name: WF-13 build exactly two APKs
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -46,7 +46,7 @@ jobs:
           clean: true
           persist-credentials: true
 
-      - name: Bootstrap and verify WF-12 identity
+      - name: Bootstrap and verify WF-13 identity
         id: workflow_identity
         shell: bash
         run: |
@@ -55,7 +55,7 @@ jobs:
           mkdir -p "$LOG_DIR" "$PACKAGE_DIR"
           printf '%s\n' 'bootstrap-and-verify-workflow-identity' > "$LOG_DIR/current-stage.txt"
 
-          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/wf12-identity.log"
+          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/wf13-identity.log"
           from __future__ import annotations
 
           import hashlib
@@ -64,8 +64,8 @@ jobs:
           from pathlib import Path
 
           workflows_dir = Path('.github/workflows')
-          expected_name = 'name: Menchino Android Build WF-12'
-          expected_signature = 'WORKFLOW_SIGNATURE: MENCHINO-WF12-20260718-R1'
+          expected_name = 'name: Menchino Android Build WF-13'
+          expected_signature = 'WORKFLOW_SIGNATURE: MENCHINO-WF13-20260718-R1'
           candidates = []
 
           for path in sorted([*workflows_dir.glob('*.yml'), *workflows_dir.glob('*.yaml')]):
@@ -88,8 +88,8 @@ jobs:
           matches = [item for item in candidates if item['has_expected_name'] and item['has_expected_signature']]
           if len(matches) != 1:
               raise SystemExit(
-                  f'WF-12 identity check expected exactly one matching workflow file, found {len(matches)}. '
-                  'The file may use any .yml/.yaml filename, but its internal WF-12 name and signature must be intact.'
+                  f'WF-13 identity check expected exactly one matching workflow file, found {len(matches)}. '
+                  'The file may use any .yml/.yaml filename, but its internal WF-13 name and signature must be intact.'
               )
 
           selected = matches[0]
@@ -123,7 +123,7 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
             echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } | tee "$LOG_DIR/wf12-identity.txt"
+          } | tee "$LOG_DIR/wf13-identity.txt"
 
       - name: Pull and verify Git LFS objects
         shell: bash
@@ -181,22 +181,30 @@ jobs:
                   return 0
 
           def detect_unity_roots(names: list[str]) -> list[str]:
-              normalized = {name.rstrip('/') for name in names}
+              # ZIP creators are not required to emit explicit directory entries.
+              # Detect Assets by file-path prefix instead of requiring an exact
+              # "Assets" member, which incorrectly rejected valid source ZIPs.
+              normalized = {
+                  name.replace('\\', '/').strip('/')
+                  for name in names
+                  if name and name.strip('/')
+              }
               roots: set[str] = set()
               for name in normalized:
                   parts = PurePosixPath(name).parts
-                  if not parts or parts[-1] != 'manifest.json':
+                  if len(parts) < 2 or parts[-2:] != ('Packages', 'manifest.json'):
                       continue
-                  if len(parts) < 2 or parts[-2] != 'Packages':
-                      continue
+
                   prefix = '/'.join(parts[:-2])
                   base = f'{prefix}/' if prefix else ''
-                  required = {
-                      f'{base}Assets',
-                      f'{base}Packages/manifest.json',
-                      f'{base}ProjectSettings/ProjectVersion.txt',
-                  }
-                  if required.issubset(normalized):
+                  project_version = f'{base}ProjectSettings/ProjectVersion.txt'
+                  assets_prefix = f'{base}Assets/'
+                  has_assets_content = any(
+                      candidate == f'{base}Assets' or candidate.startswith(assets_prefix)
+                      for candidate in normalized
+                  )
+
+                  if project_version in normalized and has_assets_content:
                       roots.add(prefix)
               return sorted(roots)
 
@@ -231,7 +239,9 @@ jobs:
                       corrupt_member = bundle.testzip()
                       if corrupt_member:
                           raise RuntimeError(f'corrupt_member:{corrupt_member}')
-                      roots = detect_unity_roots(bundle.namelist())
+                      member_names = bundle.namelist()
+                      roots = detect_unity_roots(member_names)
+                      record['zip_member_count'] = len(member_names)
               except Exception as error:
                   record['status'] = 'rejected'
                   record['reason'] = f'invalid_zip:{error}'
@@ -411,7 +421,7 @@ jobs:
                   output.write(f'{key}<<{delimiter}\n{value}\n{delimiter}\n')
 
           Path(os.environ['LOG_DIR'], 'activation-validation.txt').write_text(
-              'workflow=WF-12\n'
+              'workflow=WF-13\n'
               'license_xml=valid\n'
               f'license_bytes={len(license_text.encode("utf-8"))}\n'
               f'license_sha256={hashlib.sha256(license_text.encode("utf-8")).hexdigest()}\n'
@@ -429,9 +439,9 @@ jobs:
           test -n "${UNITY_LICENSE:-}"
           test -n "${UNITY_EMAIL:-}"
           test -n "${UNITY_PASSWORD:-}"
-          echo 'WF-12 activation variables are available to Unity Builder.' | tee -a "$LOG_DIR/activation-validation.txt"
+          echo 'WF-13 activation variables are available to Unity Builder.' | tee -a "$LOG_DIR/activation-validation.txt"
 
-      - name: Prepare WF-12 Unity build diagnostics
+      - name: Prepare WF-13 Unity build diagnostics
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -623,7 +633,7 @@ jobs:
           fi
 
           FAILURE_DIR=".menchino-ci/failure-bundle"
-          FAILURE_ZIP=".menchino-ci/menchino-build-error-logs-wf12-run-${GITHUB_RUN_NUMBER}.zip"
+          FAILURE_ZIP=".menchino-ci/menchino-build-error-logs-wf13-run-${GITHUB_RUN_NUMBER}.zip"
           rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
           mkdir -p "$FAILURE_DIR"
 
@@ -693,11 +703,11 @@ jobs:
           test -s "$FAILURE_ZIP"
           unzip -t "$FAILURE_ZIP"
 
-      - name: Upload WF-12 error-log ZIP directly
+      - name: Upload WF-13 error-log ZIP directly
         if: ${{ always() && (failure() || steps.unity_build.outcome != 'success' || steps.package.outcome != 'success') }}
         uses: actions/upload-artifact@v7
         with:
-          path: .menchino-ci/menchino-build-error-logs-wf12-run-${{ github.run_number }}.zip
+          path: .menchino-ci/menchino-build-error-logs-wf13-run-${{ github.run_number }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
@@ -706,5 +716,5 @@ jobs:
         if: steps.unity_build.outcome != 'success' || steps.package.outcome != 'success'
         shell: bash
         run: |
-          echo 'Menchino WF-12 failed. Download the WF-12 error-log ZIP artifact.'
+          echo 'Menchino WF-13 failed. Download the WF-13 error-log ZIP artifact.'
           exit 1
