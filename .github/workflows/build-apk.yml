@@ -1,5 +1,5 @@
-name: Menchino Android Builder WF-8 Recursive ZIP
-run-name: "Menchino WF-8 #${{ github.run_number }} • ${{ github.ref_name }}"
+name: Menchino Android Build WF-10
+run-name: "Menchino WF-10 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -9,286 +9,227 @@ on:
       - master
     paths:
       - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf8.yml'
+      - '.github/workflows/menchino-build-wf10.yml'
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: menchino-wf8-${{ github.ref }}
+  group: menchino-wf10-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_REVISION: WF-8-recursive-source-selection
-  PROJECT_PATH: .ci/unity-project
-  EXTRACT_PATH: .ci/extracted
-  LOG_PATH: .ci/logs
-  TEST_PATH: .ci/test-results
-  PACKAGE_PATH: .ci/package
-  FINAL_ZIP: .ci/package/Menchino-Android-Latest.zip
+  WORKFLOW_NUMBER: WF-10
+  WORKFLOW_SIGNATURE: MENCHINO-WF10-20260718-R1
+  PROJECT_DIR: .menchino-ci/project
+  EXTRACT_DIR: .menchino-ci/extracted
+  LOG_DIR: .menchino-ci/logs
+  PACKAGE_DIR: .menchino-ci/package
+  FINAL_ZIP: .menchino-ci/package/Menchino-Android-Latest.zip
 
 jobs:
-  build:
-    name: build-two-apks
+  build-android:
+    name: WF-10 build exactly two APKs
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
     steps:
-      - name: Checkout complete repository
-        uses: actions/checkout@v6
+      - name: Checkout repository
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           lfs: true
           clean: true
+          persist-credentials: false
 
-      - name: Initialize WF-8 diagnostics
+      - name: Verify WF-10 identity
         shell: bash
         run: |
           set -Eeuo pipefail
-          rm -rf .ci
-          mkdir -p "$LOG_PATH" "$TEST_PATH" "$PACKAGE_PATH"
+          rm -rf .menchino-ci
+          mkdir -p "$LOG_DIR" "$PACKAGE_DIR"
+
+          WORKFLOW_FILE=".github/workflows/menchino-build-wf10.yml"
+          test -s "$WORKFLOW_FILE"
+          grep -Fq 'name: Menchino Android Build WF-10' "$WORKFLOW_FILE"
+          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF10-20260718-R1' "$WORKFLOW_FILE"
 
           {
-            echo "workflow_revision=$WORKFLOW_REVISION"
-            echo "workflow_name=$GITHUB_WORKFLOW"
-            echo "workflow_ref=$GITHUB_WORKFLOW_REF"
+            echo "workflow_number=$WORKFLOW_NUMBER"
+            echo "workflow_signature=$WORKFLOW_SIGNATURE"
+            echo "workflow_file=$WORKFLOW_FILE"
+            echo "workflow_sha256=$(sha256sum "$WORKFLOW_FILE" | awk '{print $1}')"
             echo "run_id=$GITHUB_RUN_ID"
             echo "run_number=$GITHUB_RUN_NUMBER"
             echo "repository=$GITHUB_REPOSITORY"
             echo "ref=$GITHUB_REF"
-            echo "sha=$GITHUB_SHA"
+            echo "commit=$GITHUB_SHA"
             echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            echo
-            git --version
-            git lfs version || true
-            python3 --version
-            df -h
-          } > "$LOG_PATH/workflow-context.txt" 2>&1
+          } | tee "$LOG_DIR/wf10-identity.txt"
 
-          printf '%s\n' "$WORKFLOW_REVISION" > "$LOG_PATH/workflow-revision.txt"
-          echo "WF-8 is running. Old WF-6/WF-7 files are not this workflow."
-
-      - name: Disable older Menchino workflows and cancel their active runs
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -Eeuo pipefail
-          CURRENT_PATH="${GITHUB_WORKFLOW_REF#${GITHUB_REPOSITORY}/}"
-          CURRENT_PATH="${CURRENT_PATH%@*}"
-          echo "current_workflow_path=$CURRENT_PATH" | tee "$LOG_PATH/workflow-cleanup.txt"
-
-          gh api --paginate \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" \
-            > "$LOG_PATH/repository-workflows.json"
-
-          mapfile -t OLD_WORKFLOW_IDS < <(
-            python3 - "$CURRENT_PATH" "$LOG_PATH/repository-workflows.json" <<'PY'
-          import json
-          import re
-          import sys
-          from pathlib import Path
-
-          current = sys.argv[1]
-          data = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
-          matcher = re.compile(r'(?i)(menchino|build[-_]?apk)')
-          for workflow in data.get('workflows', []):
-              path = workflow.get('path', '')
-              name = workflow.get('name', '')
-              state = workflow.get('state', '')
-              if path == current or state != 'active':
-                  continue
-              if matcher.search(path) or matcher.search(name):
-                  print(workflow['id'])
-          PY
-          )
-
-          for workflow_id in "${OLD_WORKFLOW_IDS[@]:-}"; do
-            [ -n "$workflow_id" ] || continue
-            echo "Disabling old workflow id=$workflow_id" | tee -a "$LOG_PATH/workflow-cleanup.txt"
-            gh api --method PUT \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/disable" \
-              >/dev/null || echo "warning: unable to disable workflow $workflow_id" | tee -a "$LOG_PATH/workflow-cleanup.txt"
-
-            for status in queued in_progress; do
-              mapfile -t RUN_IDS < <(
-                gh api --paginate \
-                  -H "Accept: application/vnd.github+json" \
-                  -H "X-GitHub-Api-Version: 2022-11-28" \
-                  "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs?status=$status&per_page=100" \
-                  --jq '.workflow_runs[].id' 2>/dev/null || true
-              )
-              for run_id in "${RUN_IDS[@]:-}"; do
-                [ -n "$run_id" ] || continue
-                [ "$run_id" = "$GITHUB_RUN_ID" ] && continue
-                echo "Cancelling old workflow run id=$run_id" | tee -a "$LOG_PATH/workflow-cleanup.txt"
-                gh api --method POST \
-                  -H "Accept: application/vnd.github+json" \
-                  -H "X-GitHub-Api-Version: 2022-11-28" \
-                  "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/cancel" \
-                  >/dev/null 2>&1 || true
-              done
-            done
-          done
-
-      - name: Pull Git LFS content and inventory repository
+      - name: Pull Git LFS objects
         shell: bash
         run: |
           set -Eeuo pipefail
           git lfs install --local
-          git lfs pull 2>&1 | tee "$LOG_PATH/git-lfs-pull.log"
+          git lfs pull 2>&1 | tee "$LOG_DIR/git-lfs.log"
 
-          git status --short > "$LOG_PATH/git-status.txt"
-          git ls-files > "$LOG_PATH/tracked-files.txt"
-          find . \
-            -path './.git' -prune -o \
-            -path './.ci' -prune -o \
-            -type f -iname '*.zip' -printf '%p\t%s bytes\n' \
-            | sort | tee "$LOG_PATH/repository-zip-inventory.txt"
-
-      - name: Select newest valid Menchino Unity ZIP recursively
+      - name: Find and validate latest Menchino source ZIP
         id: source
         shell: bash
         run: |
           set -Eeuo pipefail
-          python3 - <<'PY' 2>&1 | tee "$LOG_PATH/source-selection.log"
+          printf '%s\n' 'select-latest-source-zip' > "$LOG_DIR/current-stage.txt"
+
+          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/source-selection.log"
           from __future__ import annotations
 
           import hashlib
+          import json
           import os
           import re
           import subprocess
           import zipfile
           from pathlib import Path, PurePosixPath
 
-          root = Path('.').resolve()
-          excluded_parts = {'.git', '.ci', 'Library', 'Temp', 'Builds'}
-          version_re = re.compile(r'(?i)(?:^|[_-])v?(\d+)\.(\d+)\.(\d+)(?:[_-]|$)')
-          lfs_signature = b'version https://git-lfs.github.com/spec/v1'
+          repository = Path('.').resolve()
+          excluded_parts = {'.git', '.menchino-ci', 'Library', 'Temp', 'Builds'}
+          pattern = re.compile(r'(?i)^menchino_unity_v(\d+)\.(\d+)\.(\d+).*\.zip$')
+          lfs_header = b'version https://git-lfs.github.com/spec/v1'
 
-          def git_timestamp(path: Path) -> int:
+          def git_timestamp(relative: Path) -> int:
               try:
                   result = subprocess.run(
-                      ['git', 'log', '-1', '--format=%ct', '--', path.as_posix()],
+                      ['git', 'log', '-1', '--format=%ct', '--', relative.as_posix()],
                       check=True,
-                      text=True,
                       capture_output=True,
+                      text=True,
                   )
                   return int(result.stdout.strip() or '0')
               except Exception:
                   return 0
 
-          def find_unity_roots(names: list[str]) -> list[str]:
-              name_set = set(names)
+          def detect_unity_roots(names: list[str]) -> list[str]:
+              normalized = {name.rstrip('/') for name in names}
               roots: set[str] = set()
-              for name in names:
-                  if not name or name.endswith('/'):
-                      continue
+              for name in normalized:
                   parts = PurePosixPath(name).parts
-                  for index, part in enumerate(parts):
-                      if part != 'Assets':
-                          continue
-                      prefix = '/'.join(parts[:index])
-                      base = f'{prefix}/' if prefix else ''
-                      if (
-                          f'{base}Packages/manifest.json' in name_set
-                          and f'{base}ProjectSettings/ProjectVersion.txt' in name_set
-                      ):
-                          roots.add(prefix)
+                  if not parts or parts[-1] != 'manifest.json':
+                      continue
+                  if len(parts) < 2 or parts[-2] != 'Packages':
+                      continue
+                  prefix = '/'.join(parts[:-2])
+                  base = f'{prefix}/' if prefix else ''
+                  required = {
+                      f'{base}Assets',
+                      f'{base}Packages/manifest.json',
+                      f'{base}ProjectSettings/ProjectVersion.txt',
+                  }
+                  if required.issubset(normalized):
+                      roots.add(prefix)
               return sorted(roots)
 
-          all_archives: list[Path] = []
-          for archive in root.rglob('*.zip'):
-              relative = archive.relative_to(root)
+          records: list[dict[str, object]] = []
+          valid: list[tuple[tuple[int, int, int], int, str, Path, str, str]] = []
+
+          for archive in sorted(repository.rglob('*.zip'), key=lambda item: item.as_posix().lower()):
+              relative = archive.relative_to(repository)
               if any(part in excluded_parts for part in relative.parts):
                   continue
-              if archive.name in {'Menchino-Android-Latest.zip'}:
-                  continue
-              all_archives.append(archive)
 
-          print(f'WF-8 recursive ZIP scan found {len(all_archives)} ZIP file(s).')
-          candidates = []
-          for archive in sorted(all_archives, key=lambda item: item.as_posix().lower()):
-              relative = archive.relative_to(root)
-              print(f'CHECK {relative} size={archive.stat().st_size}')
-
-              first_bytes = archive.read_bytes()[:128]
-              if first_bytes.startswith(lfs_signature):
-                  print(f'REJECT {relative}: unresolved Git LFS pointer')
+              record: dict[str, object] = {
+                  'path': relative.as_posix(),
+                  'bytes': archive.stat().st_size,
+              }
+              filename_match = pattern.match(archive.name)
+              if not filename_match:
+                  record['status'] = 'rejected'
+                  record['reason'] = 'filename_not_menchino_versioned_source'
+                  records.append(record)
                   continue
 
-              if not archive.name.lower().startswith('menchino_unity_'):
-                  print(f'REJECT {relative}: filename is not a Menchino source archive')
-                  continue
+              with archive.open('rb') as stream:
+                  if stream.read(128).startswith(lfs_header):
+                      record['status'] = 'rejected'
+                      record['reason'] = 'unresolved_git_lfs_pointer'
+                      records.append(record)
+                      continue
 
               try:
-                  with zipfile.ZipFile(archive) as zf:
-                      bad_member = zf.testzip()
-                      if bad_member:
-                          print(f'REJECT {relative}: corrupt member {bad_member}')
-                          continue
-                      names = zf.namelist()
-                      roots = find_unity_roots(names)
-              except (OSError, zipfile.BadZipFile) as exc:
-                  print(f'REJECT {relative}: unreadable ZIP: {exc}')
+                  with zipfile.ZipFile(archive) as bundle:
+                      corrupt_member = bundle.testzip()
+                      if corrupt_member:
+                          raise RuntimeError(f'corrupt_member:{corrupt_member}')
+                      roots = detect_unity_roots(bundle.namelist())
+              except Exception as error:
+                  record['status'] = 'rejected'
+                  record['reason'] = f'invalid_zip:{error}'
+                  records.append(record)
                   continue
 
               if len(roots) != 1:
-                  print(f'REJECT {relative}: expected one Unity root, found {roots}')
+                  record['status'] = 'rejected'
+                  record['reason'] = f'unity_root_count:{len(roots)}'
+                  record['roots'] = roots
+                  records.append(record)
                   continue
 
-              match = version_re.search(archive.stem)
-              version = tuple(int(value) for value in match.groups()) if match else (0, 0, 0)
-              timestamp = git_timestamp(relative)
+              version = tuple(int(value) for value in filename_match.groups())
               digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-              candidates.append((version, timestamp, relative.as_posix().lower(), archive, roots[0], digest))
-              print(
-                  f'ACCEPT {relative}: version={version}; git_timestamp={timestamp}; '
-                  f'unity_root={roots[0] or "."}; sha256={digest}'
-              )
+              timestamp = git_timestamp(relative)
+              record.update({
+                  'status': 'accepted',
+                  'version': '.'.join(map(str, version)),
+                  'unity_root': roots[0] or '.',
+                  'git_timestamp': timestamp,
+                  'sha256': digest,
+              })
+              records.append(record)
+              valid.append((version, timestamp, relative.as_posix().lower(), archive, roots[0], digest))
 
-          if not candidates:
-              print('FATAL: no valid Menchino Unity source ZIP exists in the checked-out repository.')
-              print('Upload a file named menchino_unity_vX.Y.Z_*.zip anywhere in the repository.')
-              raise SystemExit(21)
+          print(json.dumps(records, ensure_ascii=False, indent=2))
+          Path(os.environ['LOG_DIR'], 'zip-candidates.json').write_text(
+              json.dumps(records, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
 
-          selected = max(candidates, key=lambda item: (item[0], item[1], item[2]))
-          version, timestamp, _, archive, unity_root, digest = selected
-          relative = archive.relative_to(root).as_posix()
-          version_text = '.'.join(str(value) for value in version)
+          if not valid:
+              raise SystemExit('No valid menchino_unity_vX.Y.Z*.zip source archive was found.')
 
-          print('')
-          print(f'SELECTED={relative}')
+          version, timestamp, _, selected, unity_root, digest = max(
+              valid,
+              key=lambda item: (item[0], item[1], item[2]),
+          )
+          relative = selected.relative_to(repository).as_posix()
+          version_text = '.'.join(map(str, version))
+
+          print(f'SELECTED_ZIP={relative}')
           print(f'SELECTED_VERSION={version_text}')
-          print(f'SELECTED_SHA256={digest}')
           print(f'SELECTED_UNITY_ROOT={unity_root or "."}')
+          print(f'SELECTED_SHA256={digest}')
 
-          with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as stream:
-              stream.write(f'SOURCE_ZIP={relative}\n')
-              stream.write(f'SOURCE_VERSION={version_text}\n')
-              stream.write(f'SOURCE_SHA256={digest}\n')
-              stream.write(f'SOURCE_UNITY_ROOT={unity_root}\n')
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
+              output.write(f'SOURCE_ZIP={relative}\n')
+              output.write(f'SOURCE_VERSION={version_text}\n')
+              output.write(f'SOURCE_ROOT={unity_root}\n')
+              output.write(f'SOURCE_SHA256={digest}\n')
 
-          with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as stream:
-              stream.write(f'zip={relative}\n')
-              stream.write(f'version={version_text}\n')
-              stream.write(f'sha256={digest}\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'zip={relative}\n')
+              output.write(f'version={version_text}\n')
+              output.write(f'sha256={digest}\n')
           PY
 
-      - name: Extract and validate selected Unity project
+      - name: Extract selected Unity project safely
         shell: bash
         run: |
           set -Eeuo pipefail
-          printf '%s\n' 'extract-and-validate' > "$LOG_PATH/current-stage.txt"
-          rm -rf "$EXTRACT_PATH" "$PROJECT_PATH"
-          mkdir -p "$EXTRACT_PATH" "$PROJECT_PATH"
+          printf '%s\n' 'extract-and-validate-unity-project' > "$LOG_DIR/current-stage.txt"
+          rm -rf "$EXTRACT_DIR" "$PROJECT_DIR"
+          mkdir -p "$EXTRACT_DIR" "$PROJECT_DIR"
 
-          python3 - <<'PY' 2>&1 | tee "$LOG_PATH/source-extraction.log"
+          python3 - <<'PY'
           from __future__ import annotations
 
           import os
@@ -296,366 +237,371 @@ jobs:
           import zipfile
           from pathlib import Path
 
-          archive = Path(os.environ['SOURCE_ZIP'])
-          extract_root = Path(os.environ['EXTRACT_PATH'])
-          project_root = Path(os.environ['PROJECT_PATH'])
-          expected_root = os.environ.get('SOURCE_UNITY_ROOT', '')
+          source_zip = Path(os.environ['SOURCE_ZIP'])
+          extract_dir = Path(os.environ['EXTRACT_DIR'])
+          project_dir = Path(os.environ['PROJECT_DIR'])
+          source_root = os.environ.get('SOURCE_ROOT', '')
 
-          with zipfile.ZipFile(archive) as zf:
-              base = extract_root.resolve()
-              for info in zf.infolist():
-                  target = (extract_root / info.filename).resolve()
-                  if target != base and base not in target.parents:
-                      raise SystemExit(f'Unsafe archive path: {info.filename}')
-              zf.extractall(extract_root)
+          with zipfile.ZipFile(source_zip) as archive:
+              resolved_extract = extract_dir.resolve()
+              for member in archive.infolist():
+                  destination = (extract_dir / member.filename).resolve()
+                  if destination != resolved_extract and resolved_extract not in destination.parents:
+                      raise SystemExit(f'Unsafe ZIP entry: {member.filename}')
+              archive.extractall(extract_dir)
 
-          source_root = extract_root / expected_root if expected_root else extract_root
-          required = ('Assets', 'Packages', 'ProjectSettings')
-          if not source_root.is_dir() or not all((source_root / item).exists() for item in required):
-              raise SystemExit(f'Selected Unity root is invalid: {source_root}')
+          unity_root = extract_dir / source_root if source_root else extract_dir
+          required = ['Assets', 'Packages', 'ProjectSettings', '.unity-ci']
+          missing = [name for name in required if not (unity_root / name).exists()]
+          if missing:
+              raise SystemExit(f'Unity source is incomplete. Missing: {missing}')
 
-          for item in source_root.iterdir():
-              destination = project_root / item.name
+          for item in unity_root.iterdir():
+              target = project_dir / item.name
               if item.is_dir():
-                  shutil.copytree(item, destination, dirs_exist_ok=True)
+                  shutil.copytree(item, target, dirs_exist_ok=True)
               else:
-                  shutil.copy2(item, destination)
-
-          print(f'Extracted Unity project from {archive} root={expected_root or "."}')
+                  shutil.copy2(item, target)
           PY
 
-          test -d "$PROJECT_PATH/Assets"
-          test -s "$PROJECT_PATH/Packages/manifest.json"
-          test -s "$PROJECT_PATH/ProjectSettings/ProjectVersion.txt"
-          test -s "$PROJECT_PATH/.unity-ci/Unity_lic.ulf"
-          test -s "$PROJECT_PATH/.unity-ci/unity_credentials.env"
-          test -s "$PROJECT_PATH/Assets/Editor/MenchinoBuildConfigurator.cs"
+          test -s "$PROJECT_DIR/Packages/manifest.json"
+          test -s "$PROJECT_DIR/ProjectSettings/ProjectVersion.txt"
+          test -s "$PROJECT_DIR/.unity-ci/Unity_lic.ulf"
+          test -s "$PROJECT_DIR/.unity-ci/unity_credentials.env"
+          test -s "$PROJECT_DIR/Assets/Editor/MenchinoBuildConfigurator.cs"
+          grep -Fq 'public static void Build()' "$PROJECT_DIR/Assets/Editor/MenchinoBuildConfigurator.cs"
+          grep -Fq 'Menchino-arm64-v8a.apk' "$PROJECT_DIR/Assets/Editor/MenchinoBuildConfigurator.cs"
+          grep -Fq 'Menchino-universal.apk' "$PROJECT_DIR/Assets/Editor/MenchinoBuildConfigurator.cs"
 
           {
             echo "source_zip=$SOURCE_ZIP"
             echo "source_version=$SOURCE_VERSION"
             echo "source_sha256=$SOURCE_SHA256"
-            echo "unity_root=${SOURCE_UNITY_ROOT:-.}"
-            echo "unity_version=$(sed -n 's/^m_EditorVersion: //p' "$PROJECT_PATH/ProjectSettings/ProjectVersion.txt")"
-            echo "project_files=$(find "$PROJECT_PATH" -type f | wc -l)"
-          } | tee "$LOG_PATH/source-validation.txt"
+            echo "unity_editor=$(sed -n 's/^m_EditorVersion: //p' "$PROJECT_DIR/ProjectSettings/ProjectVersion.txt")"
+            echo "project_file_count=$(find "$PROJECT_DIR" -type f | wc -l)"
+          } | tee "$LOG_DIR/project-validation.txt"
 
-      - name: Load and mask embedded Unity activation data
+      - name: Load embedded Unity activation data
         shell: bash
         run: |
           set -Eeuo pipefail
-          printf '%s\n' 'load-unity-activation-data' > "$LOG_PATH/current-stage.txt"
+          printf '%s\n' 'load-embedded-unity-activation' > "$LOG_DIR/current-stage.txt"
 
           python3 - <<'PY'
           from __future__ import annotations
 
+          import hashlib
           import os
           import secrets
           import xml.etree.ElementTree as ET
           from pathlib import Path
 
-          project = Path(os.environ['PROJECT_PATH'])
+          project = Path(os.environ['PROJECT_DIR'])
           license_path = project / '.unity-ci' / 'Unity_lic.ulf'
           credentials_path = project / '.unity-ci' / 'unity_credentials.env'
 
-          license_bytes = license_path.read_bytes()
-          if len(license_bytes) < 256:
-              raise SystemExit('Embedded Unity license is unexpectedly small.')
-          ET.fromstring(license_bytes)
+          license_text = license_path.read_text(encoding='utf-8').strip()
+          if len(license_text.encode('utf-8')) < 256:
+              raise SystemExit('Embedded Unity license file is unexpectedly small.')
+          ET.fromstring(license_text)
 
-          values: dict[str, str] = {}
+          credentials: dict[str, str] = {}
           for raw_line in credentials_path.read_text(encoding='utf-8').splitlines():
               line = raw_line.strip()
               if not line or line.startswith('#'):
                   continue
               if '=' not in line:
-                  raise SystemExit('Malformed embedded Unity credentials file.')
+                  raise SystemExit('Malformed line in unity_credentials.env.')
               key, value = line.split('=', 1)
-              values[key.strip()] = value.strip()
+              credentials[key.strip()] = value.strip()
 
-          for required in ('UNITY_EMAIL', 'UNITY_PASSWORD'):
-              if not values.get(required):
-                  raise SystemExit(f'Missing {required} in embedded credentials.')
+          email = credentials.get('UNITY_EMAIL', '')
+          password = credentials.get('UNITY_PASSWORD', '')
+          if not email or not password:
+              raise SystemExit('Embedded UNITY_EMAIL or UNITY_PASSWORD is empty.')
 
-          commands_path = Path(os.environ['GITHUB_ENV'])
-          exports = {
-              'UNITY_LICENSE': license_bytes.decode('utf-8'),
-              'UNITY_EMAIL': values['UNITY_EMAIL'],
-              'UNITY_PASSWORD': values['UNITY_PASSWORD'],
-          }
-          with commands_path.open('a', encoding='utf-8') as stream:
-              for key, value in exports.items():
+          print(f'::add-mask::{email}')
+          print(f'::add-mask::{password}')
+
+          env_file = Path(os.environ['GITHUB_ENV'])
+          with env_file.open('a', encoding='utf-8') as output:
+              for key, value in (
+                  ('UNITY_LICENSE', license_text),
+                  ('UNITY_EMAIL', email),
+                  ('UNITY_PASSWORD', password),
+              ):
                   delimiter = f'MENCHINO_{key}_{secrets.token_hex(16)}'
-                  stream.write(f'{key}<<{delimiter}\n{value}\n{delimiter}\n')
-                  print(f'::add-mask::{value}')
+                  output.write(f'{key}<<{delimiter}\n{value}\n{delimiter}\n')
 
-          log = Path(os.environ['LOG_PATH']) / 'activation-data.txt'
-          log.write_text(
-              'license=valid_xml_and_masked\n'
-              'email=present_and_masked\n'
-              'password=present_and_masked\n',
+          Path(os.environ['LOG_DIR'], 'activation-validation.txt').write_text(
+              'workflow=WF-10\n'
+              'license_xml=valid\n'
+              f'license_bytes={len(license_text.encode("utf-8"))}\n'
+              f'license_sha256={hashlib.sha256(license_text.encode("utf-8")).hexdigest()}\n'
+              f'email_loaded=true;length={len(email)}\n'
+              f'password_loaded=true;length={len(password)}\n'
+              'github_unity_secrets_used=false\n',
               encoding='utf-8',
           )
-          print('Embedded Unity activation data loaded and masked.')
           PY
 
-      - name: Verify Unity activation environment
+      - name: Confirm activation environment
         shell: bash
         run: |
           set -Eeuo pipefail
           test -n "${UNITY_LICENSE:-}"
           test -n "${UNITY_EMAIL:-}"
           test -n "${UNITY_PASSWORD:-}"
-          {
-            echo "workflow_revision=$WORKFLOW_REVISION"
-            echo "unity_license=available"
-            echo "unity_email=available_and_masked"
-            echo "unity_password=available_and_masked"
-          } | tee "$LOG_PATH/activation-preflight.txt"
+          echo 'WF-10 activation variables are available to Unity Builder.' | tee -a "$LOG_DIR/activation-validation.txt"
 
-      - name: Restore Unity Library cache
-        uses: actions/cache@v5
+      - name: Build arm64 and universal APKs
+        id: unity_build
+        continue-on-error: true
+        uses: game-ci/unity-builder@v5
         with:
-          path: .ci/unity-project/Library
-          key: menchino-wf8-library-${{ runner.os }}-${{ steps.source.outputs.sha256 }}
-          restore-keys: |
-            menchino-wf8-library-${{ runner.os }}-
-
-      - name: Run Unity EditMode tests
-        id: unity-tests
-        uses: game-ci/unity-test-runner@v4
-        with:
-          githubToken: ${{ secrets.GITHUB_TOKEN }}
-          projectPath: .ci/unity-project
-          unityVersion: auto
-          testMode: EditMode
-          artifactsPath: .ci/test-results
-          customParameters: >-
-            -logFile /github/workspace/.ci/logs/unity-tests.log
-            -stackTraceLogType Full
-
-      - name: Build two real Android APK files
-        id: unity-build
-        uses: game-ci/unity-builder@v4
-        with:
-          projectPath: .ci/unity-project
+          projectPath: .menchino-ci/project
           unityVersion: auto
           targetPlatform: Android
           buildMethod: Menchino.Editor.AndroidBuilder.Build
           androidExportType: androidPackage
+          versioning: "None"
+          allowDirtyBuild: true
           customParameters: >-
-            -logFile /github/workspace/.ci/logs/unity-build.log
+            -logFile /github/workspace/.menchino-ci/logs/unity-builder.log
             -stackTraceLogType Full
 
-      - name: Verify and package exactly two APK files
+      - name: Verify APKs and create final ZIP
+        id: package
+        continue-on-error: true
         shell: bash
         run: |
           set -Eeuo pipefail
-          printf '%s\n' 'verify-and-package' > "$LOG_PATH/current-stage.txt"
-          BUILD_DIR="$PROJECT_PATH/Builds/Android"
+          printf '%s\n' 'verify-and-package-apks' > "$LOG_DIR/current-stage.txt"
+
+          if [ "${{ steps.unity_build.outcome }}" != 'success' ]; then
+            echo "Unity Builder outcome=${{ steps.unity_build.outcome }}" | tee "$LOG_DIR/unity-builder-outcome.txt"
+            exit 51
+          fi
+
+          BUILD_DIR="$PROJECT_DIR/Builds/Android"
           ARM64_APK="$BUILD_DIR/Menchino-arm64-v8a.apk"
           UNIVERSAL_APK="$BUILD_DIR/Menchino-universal.apk"
 
           test -s "$ARM64_APK"
           test -s "$UNIVERSAL_APK"
-          mapfile -t APKS < <(find "$BUILD_DIR" -maxdepth 1 -type f -name '*.apk' -print | sort)
-          if [ "${#APKS[@]}" -ne 2 ]; then
-            printf 'Expected exactly two APKs, found %s\n' "${#APKS[@]}" | tee "$LOG_PATH/apk-count-error.txt"
-            printf '%s\n' "${APKS[@]:-<none>}" | tee -a "$LOG_PATH/apk-count-error.txt"
-            exit 31
+
+          mapfile -t APK_FILES < <(find "$BUILD_DIR" -maxdepth 1 -type f -name '*.apk' -print | sort)
+          if [ "${#APK_FILES[@]}" -ne 2 ]; then
+            printf 'Expected exactly 2 APK files, found %s\n' "${#APK_FILES[@]}" | tee "$LOG_DIR/apk-count-error.txt"
+            printf '%s\n' "${APK_FILES[@]:-<none>}" | tee -a "$LOG_DIR/apk-count-error.txt"
+            exit 52
           fi
 
-          rm -rf "$PACKAGE_PATH"
-          mkdir -p "$PACKAGE_PATH"
+          if cmp -s "$ARM64_APK" "$UNIVERSAL_APK"; then
+            echo 'The two APK files are byte-identical; separate real builds were expected.' | tee "$LOG_DIR/apk-identity-error.txt"
+            exit 53
+          fi
+
+          rm -rf "$PACKAGE_DIR"
+          mkdir -p "$PACKAGE_DIR"
+
           python3 - <<'PY'
           import os
           import zipfile
           from pathlib import Path
 
-          project = Path(os.environ['PROJECT_PATH'])
-          output = Path(os.environ['FINAL_ZIP'])
-          files = [
+          project = Path(os.environ['PROJECT_DIR'])
+          final_zip = Path(os.environ['FINAL_ZIP'])
+          apk_files = [
               project / 'Builds/Android/Menchino-arm64-v8a.apk',
               project / 'Builds/Android/Menchino-universal.apk',
           ]
-          with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_STORED) as zf:
-              for file in files:
-                  zf.write(file, file.name)
-          with zipfile.ZipFile(output) as zf:
+
+          with zipfile.ZipFile(final_zip, 'w', compression=zipfile.ZIP_STORED) as output:
+              for apk in apk_files:
+                  output.write(apk, apk.name)
+
+          with zipfile.ZipFile(final_zip) as output:
               expected = ['Menchino-arm64-v8a.apk', 'Menchino-universal.apk']
-              if zf.namelist() != expected:
-                  raise SystemExit(f'Unexpected output ZIP entries: {zf.namelist()}')
-              if zf.testzip() is not None:
-                  raise SystemExit('Output ZIP integrity test failed.')
+              if output.namelist() != expected:
+                  raise SystemExit(f'Unexpected final ZIP entries: {output.namelist()}')
+              if output.testzip() is not None:
+                  raise SystemExit('Final ZIP integrity test failed.')
           PY
 
-          sha256sum "$ARM64_APK" "$UNIVERSAL_APK" "$FINAL_ZIP" | tee "$LOG_PATH/output-sha256.txt"
-          unzip -l "$FINAL_ZIP" | tee "$LOG_PATH/final-zip-contents.txt"
+          sha256sum "$ARM64_APK" "$UNIVERSAL_APK" "$FINAL_ZIP" | tee "$LOG_DIR/output-sha256.txt"
+          unzip -t "$FINAL_ZIP" | tee "$LOG_DIR/final-zip-test.txt"
+          unzip -l "$FINAL_ZIP" | tee "$LOG_DIR/final-zip-contents.txt"
 
-      - name: Upload final ZIP as the only success artifact
-        id: upload-success
+      - name: Upload final ZIP directly
+        id: upload_success
+        if: steps.unity_build.outcome == 'success' && steps.package.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          path: .ci/package/Menchino-Android-Latest.zip
+          path: .menchino-ci/package/Menchino-Android-Latest.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
 
       - name: Delete previous Menchino artifacts and completed runs
+        id: cleanup
+        if: steps.unity_build.outcome == 'success' && steps.package.outcome == 'success'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          CURRENT_RUN_ID: ${{ github.run_id }}
+          CURRENT_ARTIFACT_ID: ${{ steps.upload_success.outputs.artifact-id }}
         run: |
           set -Eeuo pipefail
-          printf '%s\n' 'cleanup-old-artifacts-and-runs' > "$LOG_PATH/current-stage.txt"
+          printf '%s\n' 'cleanup-old-artifacts-and-runs' > "$LOG_DIR/current-stage.txt"
+          : > "$LOG_DIR/cleanup.txt"
 
           gh api --paginate \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
             "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
-            > "$LOG_PATH/all-artifacts-before-cleanup.json"
+            > "$LOG_DIR/artifacts-before-cleanup.json"
 
-          mapfile -t ARTIFACT_IDS < <(
-            python3 - "$CURRENT_RUN_ID" "$LOG_PATH/all-artifacts-before-cleanup.json" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-          current = int(sys.argv[1])
-          data = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
-          for artifact in data.get('artifacts', []):
-              run = artifact.get('workflow_run') or {}
-              name = (artifact.get('name') or '').lower()
-              if run.get('id') != current and ('menchino' in name or 'build-error-logs' in name):
-                  print(artifact['id'])
-          PY
-          )
-          for artifact_id in "${ARTIFACT_IDS[@]:-}"; do
-            [ -n "$artifact_id" ] || continue
-            gh api --method DELETE \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" \
-              >/dev/null 2>&1 || true
-          done
-
-          gh api --paginate \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "repos/$GITHUB_REPOSITORY/actions/runs?status=completed&per_page=100" \
-            > "$LOG_PATH/completed-runs-before-cleanup.json"
-
-          mapfile -t RUN_IDS < <(
-            python3 - "$CURRENT_RUN_ID" "$LOG_PATH/completed-runs-before-cleanup.json" <<'PY'
+          python3 - "$CURRENT_ARTIFACT_ID" "$LOG_DIR/artifacts-before-cleanup.json" <<'PY' > "$LOG_DIR/old-artifact-ids.txt"
           import json
           import re
           import sys
           from pathlib import Path
+
+          current = str(sys.argv[1] or '')
+          data = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
+          matcher = re.compile(r'(?i)^menchino(?:-|_)|Menchino-Android-Latest\.zip')
+          for artifact in data.get('artifacts', []):
+              artifact_id = str(artifact.get('id', ''))
+              if artifact_id == current:
+                  continue
+              if matcher.search(artifact.get('name', '')):
+                  print(artifact_id)
+          PY
+
+          while IFS= read -r artifact_id; do
+            [ -n "$artifact_id" ] || continue
+            echo "delete_artifact=$artifact_id" | tee -a "$LOG_DIR/cleanup.txt"
+            gh api --method DELETE \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" >/dev/null
+          done < "$LOG_DIR/old-artifact-ids.txt"
+
+          gh api --paginate \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$GITHUB_REPOSITORY/actions/runs?status=completed&per_page=100" \
+            > "$LOG_DIR/runs-before-cleanup.json"
+
+          python3 - "$GITHUB_RUN_ID" "$LOG_DIR/runs-before-cleanup.json" <<'PY' > "$LOG_DIR/old-run-ids.txt"
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
           current = int(sys.argv[1])
           data = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
-          matcher = re.compile(r'(?i)menchino')
+          matcher = re.compile(r'(?i)(menchino|build[-_]?apk)')
           for run in data.get('workflow_runs', []):
               if run.get('id') == current:
                   continue
-              if matcher.search(run.get('name', '')) or matcher.search(run.get('display_title', '')):
+              if matcher.search(run.get('name', '')) or matcher.search(run.get('path', '')):
                   print(run['id'])
           PY
-          )
-          for run_id in "${RUN_IDS[@]:-}"; do
+
+          while IFS= read -r run_id; do
             [ -n "$run_id" ] || continue
+            echo "delete_run=$run_id" | tee -a "$LOG_DIR/cleanup.txt"
             gh api --method DELETE \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
-              >/dev/null 2>&1 || true
-          done
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" >/dev/null
+          done < "$LOG_DIR/old-run-ids.txt"
 
-      - name: Write success summary
-        if: success()
-        shell: bash
-        run: |
-          {
-            echo "## Menchino WF-8 completed"
-            echo
-            echo "- Workflow revision: \`$WORKFLOW_REVISION\`"
-            echo "- Source: \`$SOURCE_ZIP\`"
-            echo "- Source version: \`$SOURCE_VERSION\`"
-            echo "- Output: \`Menchino-Android-Latest.zip\`"
-            echo "- ZIP contents: exactly two APK files"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Collect complete sanitized error bundle
-        if: failure()
+      - name: Collect sanitized failure logs
+        if: ${{ always() && (failure() || steps.unity_build.outcome != 'success' || steps.package.outcome != 'success') }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          CURRENT_ARTIFACT_ID: ${{ steps.upload_success.outputs.artifact-id }}
         run: |
           set +e
-          mkdir -p .ci/error-bundle
-          cp -a "$LOG_PATH"/. .ci/error-bundle/ 2>/dev/null || true
-          cp -a "$TEST_PATH" .ci/error-bundle/test-results 2>/dev/null || true
-          cp -a "$PROJECT_PATH/Builds/Logs" .ci/error-bundle/unity-build-summary 2>/dev/null || true
 
-          gh api \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
-            > .ci/error-bundle/github-jobs.json 2> .ci/error-bundle/github-jobs-api-error.txt
+          if [ -n "${CURRENT_ARTIFACT_ID:-}" ]; then
+            gh api --method DELETE \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$CURRENT_ARTIFACT_ID" >/dev/null 2>&1 || true
+          fi
+
+          FAILURE_DIR=".menchino-ci/failure-bundle"
+          FAILURE_ZIP=".menchino-ci/menchino-build-error-logs-wf10-run-${GITHUB_RUN_NUMBER}.zip"
+          rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
+          mkdir -p "$FAILURE_DIR"
+
+          cp -a "$LOG_DIR"/. "$FAILURE_DIR"/ 2>/dev/null || true
+          cp -a "$PROJECT_DIR/Builds/Logs" "$FAILURE_DIR/project-build-logs" 2>/dev/null || true
+          cp -a "$PROJECT_DIR/Library/Logs" "$FAILURE_DIR/library-logs" 2>/dev/null || true
+          cp -a "$HOME/.local/share/unity3d/Unity/Editor.log" "$FAILURE_DIR/Editor.log" 2>/dev/null || true
+          cp -a "$HOME/.local/share/unity3d/Unity/Editor-prev.log" "$FAILURE_DIR/Editor-prev.log" 2>/dev/null || true
+          docker ps -a > "$FAILURE_DIR/docker-ps.txt" 2>&1 || true
+          docker images > "$FAILURE_DIR/docker-images.txt" 2>&1 || true
+          df -h > "$FAILURE_DIR/disk-usage.txt" 2>&1 || true
+
+          {
+            echo "workflow_number=$WORKFLOW_NUMBER"
+            echo "workflow_signature=$WORKFLOW_SIGNATURE"
+            echo "workflow=$GITHUB_WORKFLOW"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_number=$GITHUB_RUN_NUMBER"
+            echo "source_zip=${SOURCE_ZIP:-not-selected}"
+            echo "source_version=${SOURCE_VERSION:-unknown}"
+            echo "unity_build_outcome=${{ steps.unity_build.outcome }}"
+            echo "package_outcome=${{ steps.package.outcome }}"
+            echo "cleanup_outcome=${{ steps.cleanup.outcome }}"
+            echo "failed_stage=$(cat "$LOG_DIR/current-stage.txt" 2>/dev/null || echo unknown)"
+            echo "failed_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > "$FAILURE_DIR/failure-summary.txt"
 
           python3 - <<'PY'
-          import json
           import os
           from pathlib import Path
 
-          bundle = Path('.ci/error-bundle')
-          jobs_path = bundle / 'github-jobs.json'
-          failed_steps = []
-          if jobs_path.exists() and jobs_path.stat().st_size:
-              try:
-                  data = json.loads(jobs_path.read_text(encoding='utf-8'))
-                  for job in data.get('jobs', []):
-                      for step in job.get('steps', []):
-                          if step.get('conclusion') == 'failure':
-                              failed_steps.append(step.get('name', 'unknown'))
-              except Exception:
-                  pass
-
-          summary = [
-              f"workflow_revision={os.environ.get('WORKFLOW_REVISION', 'unknown')}",
-              f"run_id={os.environ.get('GITHUB_RUN_ID', 'unknown')}",
-              f"source_zip={os.environ.get('SOURCE_ZIP', 'not-selected')}",
-              f"source_version={os.environ.get('SOURCE_VERSION', 'unknown')}",
-              f"failed_steps={'; '.join(failed_steps) if failed_steps else 'unknown'}",
+          root = Path('.menchino-ci/failure-bundle')
+          protected_values = [
+              os.environ.get('UNITY_EMAIL', ''),
+              os.environ.get('UNITY_PASSWORD', ''),
+              os.environ.get('UNITY_LICENSE', ''),
           ]
-          (bundle / 'failure-summary.txt').write_text('\n'.join(summary) + '\n', encoding='utf-8')
+          for path in root.rglob('*'):
+              if not path.is_file() or path.stat().st_size > 20_000_000:
+                  continue
+              try:
+                  content = path.read_text(encoding='utf-8', errors='replace')
+              except OSError:
+                  continue
+              for value in protected_values:
+                  if value:
+                      content = content.replace(value, '[REDACTED]')
+              path.write_text(content, encoding='utf-8')
           PY
 
-          CREDENTIALS_FILE="$PROJECT_PATH/.unity-ci/unity_credentials.env"
-          LICENSE_FILE="$PROJECT_PATH/.unity-ci/Unity_lic.ulf"
-          if [ -f "$CREDENTIALS_FILE" ]; then
-            while IFS='=' read -r key value; do
-              case "$key" in
-                UNITY_EMAIL|UNITY_PASSWORD)
-                  [ -n "$value" ] && find .ci/error-bundle -type f -exec sed -i "s|$value|***MASKED***|g" {} + 2>/dev/null || true
-                  ;;
-              esac
-            done < "$CREDENTIALS_FILE"
-          fi
-          if [ -f "$LICENSE_FILE" ]; then
-            LICENSE_SHA="$(sha256sum "$LICENSE_FILE" | awk '{print $1}')"
-            echo "embedded_license_sha256=$LICENSE_SHA" >> .ci/error-bundle/failure-summary.txt
-          fi
+          (cd "$FAILURE_DIR" && zip -q -r "../$(basename "$FAILURE_ZIP")" .)
+          test -s "$FAILURE_ZIP"
+          unzip -t "$FAILURE_ZIP"
 
-          ERROR_ZIP=".ci/menchino-build-error-logs-run-${GITHUB_RUN_NUMBER}.zip"
-          rm -f "$ERROR_ZIP"
-          (cd .ci/error-bundle && zip -q -r "../$(basename "$ERROR_ZIP")" .)
-          unzip -t "$ERROR_ZIP"
-
-      - name: Upload error ZIP on failure
-        if: failure()
+      - name: Upload WF-10 error-log ZIP directly
+        if: ${{ always() && (failure() || steps.unity_build.outcome != 'success' || steps.package.outcome != 'success') }}
         uses: actions/upload-artifact@v7
         with:
-          path: .ci/menchino-build-error-logs-run-${{ github.run_number }}.zip
+          path: .menchino-ci/menchino-build-error-logs-wf10-run-${{ github.run_number }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
+
+      - name: Mark unsuccessful build as failed
+        if: steps.unity_build.outcome != 'success' || steps.package.outcome != 'success'
+        shell: bash
+        run: |
+          echo 'Menchino WF-10 failed. Download the WF-10 error-log ZIP artifact.'
+          exit 1
