@@ -1,8 +1,8 @@
-# Menchino Workflow Number: WF-13
-# Signature: MENCHINO-WF13-20260718-R1
-# Supersedes: WF-12
-name: Menchino Android Build WF-13
-run-name: "Menchino WF-13 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
+# Menchino Workflow Number: WF-14
+# Signature: MENCHINO-WF14-20260718-R1
+# Supersedes: WF-13
+name: Menchino Android Build WF-14 Serial-First Diagnostics
+run-name: "Menchino WF-14 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -12,19 +12,20 @@ on:
       - master
     paths:
       - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf13.yml'
+      - '.github/workflows/menchino-build-wf14.yml'
+      - '.github/workflows/build-apk.yml'
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: menchino-wf13-${{ github.ref }}
+  group: menchino-wf14-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_NUMBER: WF-13
-  WORKFLOW_SIGNATURE: MENCHINO-WF13-20260718-R1
+  WORKFLOW_NUMBER: WF-14
+  WORKFLOW_SIGNATURE: MENCHINO-WF14-20260718-R1
   PROJECT_DIR: .menchino-ci/project
   EXTRACT_DIR: .menchino-ci/extracted
   LOG_DIR: .menchino-ci/logs
@@ -33,20 +34,20 @@ env:
 
 jobs:
   build-android:
-    name: WF-13 build exactly two APKs
+    name: WF-14 build exactly two APKs
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
           lfs: true
           clean: true
           persist-credentials: true
 
-      - name: Bootstrap and verify WF-13 identity
+      - name: Bootstrap and verify WF-14 identity
         id: workflow_identity
         shell: bash
         run: |
@@ -55,7 +56,7 @@ jobs:
           mkdir -p "$LOG_DIR" "$PACKAGE_DIR"
           printf '%s\n' 'bootstrap-and-verify-workflow-identity' > "$LOG_DIR/current-stage.txt"
 
-          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/wf13-identity.log"
+          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/wf14-identity.log"
           from __future__ import annotations
 
           import hashlib
@@ -64,8 +65,8 @@ jobs:
           from pathlib import Path
 
           workflows_dir = Path('.github/workflows')
-          expected_name = 'name: Menchino Android Build WF-13'
-          expected_signature = 'WORKFLOW_SIGNATURE: MENCHINO-WF13-20260718-R1'
+          expected_name = 'name: Menchino Android Build WF-14 Serial-First Diagnostics'
+          expected_signature = 'WORKFLOW_SIGNATURE: MENCHINO-WF14-20260718-R1'
           candidates = []
 
           for path in sorted([*workflows_dir.glob('*.yml'), *workflows_dir.glob('*.yaml')]):
@@ -88,8 +89,8 @@ jobs:
           matches = [item for item in candidates if item['has_expected_name'] and item['has_expected_signature']]
           if len(matches) != 1:
               raise SystemExit(
-                  f'WF-13 identity check expected exactly one matching workflow file, found {len(matches)}. '
-                  'The file may use any .yml/.yaml filename, but its internal WF-13 name and signature must be intact.'
+                  f'WF-14 identity check expected exactly one matching workflow file, found {len(matches)}. '
+                  'The file may use any .yml/.yaml filename, but its internal WF-14 name and signature must be intact.'
               )
 
           selected = matches[0]
@@ -123,7 +124,7 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
             echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } | tee "$LOG_DIR/wf13-identity.txt"
+          } | tee "$LOG_DIR/wf14-identity.txt"
 
       - name: Pull and verify Git LFS objects
         shell: bash
@@ -377,8 +378,10 @@ jobs:
           python3 - <<'PY'
           from __future__ import annotations
 
+          import base64
           import hashlib
           import os
+          import re
           import secrets
           import xml.etree.ElementTree as ET
           from pathlib import Path
@@ -390,7 +393,22 @@ jobs:
           license_text = license_path.read_text(encoding='utf-8').strip()
           if len(license_text.encode('utf-8')) < 256:
               raise SystemExit('Embedded Unity license file is unexpectedly small.')
-          ET.fromstring(license_text)
+
+          root = ET.fromstring(license_text)
+          developer_data = root.find('.//DeveloperData')
+          if developer_data is None or not developer_data.attrib.get('Value'):
+              raise SystemExit('Embedded Unity license has no DeveloperData serial payload.')
+
+          try:
+              developer_payload = base64.b64decode(developer_data.attrib['Value'], validate=True)
+              decoded_payload = developer_payload.decode('utf-8', errors='ignore')
+          except Exception as exc:
+              raise SystemExit(f'Could not decode Unity Personal serial from DeveloperData: {exc}') from exc
+
+          serial_match = re.search(r'[A-Z0-9]{2}(?:-[A-Z0-9]{4}){5}', decoded_payload)
+          if serial_match is None:
+              raise SystemExit('Decoded Unity serial has an unexpected format.')
+          serial = serial_match.group(0)
 
           credentials: dict[str, str] = {}
           for raw_line in credentials_path.read_text(encoding='utf-8').splitlines():
@@ -407,13 +425,13 @@ jobs:
           if not email or not password:
               raise SystemExit('Embedded UNITY_EMAIL or UNITY_PASSWORD is empty.')
 
-          print(f'::add-mask::{email}')
-          print(f'::add-mask::{password}')
+          for protected in (serial, email, password):
+              print(f'::add-mask::{protected}')
 
           env_file = Path(os.environ['GITHUB_ENV'])
           with env_file.open('a', encoding='utf-8') as output:
               for key, value in (
-                  ('UNITY_LICENSE', license_text),
+                  ('UNITY_SERIAL', serial),
                   ('UNITY_EMAIL', email),
                   ('UNITY_PASSWORD', password),
               ):
@@ -421,12 +439,16 @@ jobs:
                   output.write(f'{key}<<{delimiter}\n{value}\n{delimiter}\n')
 
           Path(os.environ['LOG_DIR'], 'activation-validation.txt').write_text(
-              'workflow=WF-13\n'
+              'workflow=WF-14\n'
+              'activation_strategy=personal-serial-first;ulf-fallback\n'
               'license_xml=valid\n'
               f'license_bytes={len(license_text.encode("utf-8"))}\n'
               f'license_sha256={hashlib.sha256(license_text.encode("utf-8")).hexdigest()}\n'
+              f'serial_loaded=true;length={len(serial)}\n'
+              f'serial_sha256={hashlib.sha256(serial.encode("utf-8")).hexdigest()}\n'
               f'email_loaded=true;length={len(email)}\n'
               f'password_loaded=true;length={len(password)}\n'
+              f'password_contains_non_alnum={str(not password.isalnum()).lower()}\n'
               'github_unity_secrets_used=false\n',
               encoding='utf-8',
           )
@@ -436,12 +458,13 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          test -n "${UNITY_LICENSE:-}"
+          test -n "${UNITY_SERIAL:-}"
+          test -s "$PROJECT_DIR/.unity-ci/Unity_lic.ulf"
           test -n "${UNITY_EMAIL:-}"
           test -n "${UNITY_PASSWORD:-}"
-          echo 'WF-13 activation variables are available to Unity Builder.' | tee -a "$LOG_DIR/activation-validation.txt"
+          echo 'WF-14 Personal serial and account variables are available; embedded ULF is ready for fallback.' | tee -a "$LOG_DIR/activation-validation.txt"
 
-      - name: Prepare WF-13 Unity build diagnostics
+      - name: Prepare WF-14 Unity build diagnostics
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -449,10 +472,10 @@ jobs:
           rm -rf "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs"
           mkdir -p "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs"
 
-      - name: Build arm64 and universal APKs
-        id: unity_build
+      - name: Build with Personal serial activation
+        id: unity_build_serial
         continue-on-error: true
-        uses: game-ci/unity-builder@v5
+        uses: game-ci/unity-builder@v5.0.0
         with:
           projectPath: .menchino-ci/project
           unityVersion: auto
@@ -461,8 +484,134 @@ jobs:
           androidExportType: androidPackage
           versioning: "None"
           allowDirtyBuild: true
+          containerRegistryImageVersion: "3"
           customParameters: >-
             -stackTraceLogType Full
+            -logFile /github/workspace/.menchino-ci/logs/unity-editor-serial.log
+
+      - name: Capture serial activation attempt diagnostics
+        id: serial_diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf '%s\n' 'classify-serial-build-attempt' > "$LOG_DIR/current-stage.txt"
+
+          PRIMARY_OUTCOME='${{ steps.unity_build_serial.outcome }}'
+          PRIMARY_ENGINE_EXIT='${{ steps.unity_build_serial.outputs.engineExitCode }}'
+          PRIMARY_ENGINE_EXIT="${PRIMARY_ENGINE_EXIT:-not-reported}"
+          APK_COUNT="$(find "$PROJECT_DIR/Builds/Android" -maxdepth 1 -type f -name '*.apk' 2>/dev/null | wc -l | tr -d ' ')"
+          PROJECT_LOG_COUNT="$(find "$PROJECT_DIR/Builds/Logs" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ')"
+          ENGINE_LOG_COUNT="$(find "$LOG_DIR" -maxdepth 1 -type f -name 'unity-editor-serial.log' -size +0c 2>/dev/null | wc -l | tr -d ' ')"
+
+          {
+            echo "serial_action_outcome=$PRIMARY_OUTCOME"
+            echo "serial_engine_exit_code=$PRIMARY_ENGINE_EXIT"
+            echo "apk_count_after_serial_attempt=$APK_COUNT"
+            echo "project_log_count_after_serial_attempt=$PROJECT_LOG_COUNT"
+            echo "engine_log_count_after_serial_attempt=$ENGINE_LOG_COUNT"
+          } | tee "$LOG_DIR/unity-builder-serial-outcome.txt"
+
+          RETRY_WITH_ULF=false
+          if [ "$PRIMARY_OUTCOME" != 'success' ] && [ "$APK_COUNT" -eq 0 ] && [ "$PROJECT_LOG_COUNT" -eq 0 ] && [ "$ENGINE_LOG_COUNT" -eq 0 ]; then
+            RETRY_WITH_ULF=true
+          fi
+
+          echo "retry_with_ulf=$RETRY_WITH_ULF" | tee -a "$LOG_DIR/unity-builder-serial-outcome.txt"
+          echo "retry_with_ulf=$RETRY_WITH_ULF" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare embedded ULF fallback environment
+        if: steps.unity_build_serial.outcome != 'success' && steps.serial_diagnostics.outputs.retry_with_ulf == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf '%s\n' 'prepare-ulf-fallback-activation' > "$LOG_DIR/current-stage.txt"
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import secrets
+          from pathlib import Path
+
+          license_path = Path(os.environ['PROJECT_DIR']) / '.unity-ci' / 'Unity_lic.ulf'
+          license_text = license_path.read_text(encoding='utf-8').strip()
+          if len(license_text.encode('utf-8')) < 256:
+              raise SystemExit('Embedded ULF fallback file is unexpectedly small.')
+
+          with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as output:
+              output.write('UNITY_SERIAL=\n')
+              delimiter = f'MENCHINO_UNITY_LICENSE_{secrets.token_hex(16)}'
+              output.write(f'UNITY_LICENSE<<{delimiter}\n{license_text}\n{delimiter}\n')
+
+          with Path(os.environ['LOG_DIR'], 'activation-fallback.txt').open('w', encoding='utf-8') as report:
+              report.write('fallback_environment=embedded-ulf\n')
+              report.write(f'license_bytes={len(license_text.encode("utf-8"))}\n')
+              report.write(f'license_sha256={hashlib.sha256(license_text.encode("utf-8")).hexdigest()}\n')
+          PY
+
+      - name: Retry with embedded ULF activation
+        id: unity_build_ulf
+        if: steps.unity_build_serial.outcome != 'success' && steps.serial_diagnostics.outputs.retry_with_ulf == 'true'
+        continue-on-error: true
+        uses: game-ci/unity-builder@v5.0.0
+        with:
+          projectPath: .menchino-ci/project
+          unityVersion: auto
+          targetPlatform: Android
+          buildMethod: Menchino.Editor.AndroidBuilder.Build
+          androidExportType: androidPackage
+          versioning: "None"
+          allowDirtyBuild: true
+          containerRegistryImageVersion: "3"
+          customParameters: >-
+            -stackTraceLogType Full
+            -logFile /github/workspace/.menchino-ci/logs/unity-editor-ulf.log
+
+      - name: Resolve final Unity build outcome
+        id: unity_result
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf '%s\n' 'resolve-final-unity-outcome' > "$LOG_DIR/current-stage.txt"
+
+          SERIAL_OUTCOME='${{ steps.unity_build_serial.outcome }}'
+          SERIAL_EXIT='${{ steps.unity_build_serial.outputs.engineExitCode }}'
+          ULF_OUTCOME='${{ steps.unity_build_ulf.outcome }}'
+          ULF_EXIT='${{ steps.unity_build_ulf.outputs.engineExitCode }}'
+          SERIAL_EXIT="${SERIAL_EXIT:-not-reported}"
+          ULF_OUTCOME="${ULF_OUTCOME:-skipped}"
+          ULF_EXIT="${ULF_EXIT:-not-reported}"
+
+          FINAL_OUTCOME=failure
+          ACTIVATION_MODE=none
+          FINAL_ENGINE_EXIT="$SERIAL_EXIT"
+          if [ "$SERIAL_OUTCOME" = 'success' ]; then
+            FINAL_OUTCOME=success
+            ACTIVATION_MODE=personal-serial
+          elif [ "$ULF_OUTCOME" = 'success' ]; then
+            FINAL_OUTCOME=success
+            ACTIVATION_MODE=embedded-ulf-fallback
+            FINAL_ENGINE_EXIT="$ULF_EXIT"
+          elif [ "$ULF_OUTCOME" != 'skipped' ]; then
+            ACTIVATION_MODE=both-failed
+            FINAL_ENGINE_EXIT="$ULF_EXIT"
+          else
+            ACTIVATION_MODE=serial-build-failed-after-project-start
+          fi
+
+          {
+            echo "serial_outcome=$SERIAL_OUTCOME"
+            echo "serial_engine_exit_code=$SERIAL_EXIT"
+            echo "ulf_outcome=$ULF_OUTCOME"
+            echo "ulf_engine_exit_code=$ULF_EXIT"
+            echo "final_outcome=$FINAL_OUTCOME"
+            echo "activation_mode=$ACTIVATION_MODE"
+            echo "final_engine_exit_code=$FINAL_ENGINE_EXIT"
+          } | tee "$LOG_DIR/unity-builder-final-outcome.txt"
+
+          echo "final_outcome=$FINAL_OUTCOME" >> "$GITHUB_OUTPUT"
+          echo "activation_mode=$ACTIVATION_MODE" >> "$GITHUB_OUTPUT"
+          echo "engine_exit_code=$FINAL_ENGINE_EXIT" >> "$GITHUB_OUTPUT"
 
       - name: Verify APKs and create final ZIP
         id: package
@@ -471,9 +620,9 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          if [ "${{ steps.unity_build.outcome }}" != 'success' ]; then
-            printf '%s\n' 'unity-build-failed' > "$LOG_DIR/current-stage.txt"
-            echo "Unity Builder outcome=${{ steps.unity_build.outcome }}" | tee "$LOG_DIR/unity-builder-outcome.txt"
+          if [ '${{ steps.unity_result.outputs.final_outcome }}' != 'success' ]; then
+            printf '%s\n' 'unity-activation-or-build-failed' > "$LOG_DIR/current-stage.txt"
+            cat "$LOG_DIR/unity-builder-final-outcome.txt" 2>/dev/null || true
             find "$PROJECT_DIR/Builds/Logs" -maxdepth 2 -type f -printf '%p %s bytes\n' 2>/dev/null \
               | sort | tee "$LOG_DIR/unity-project-log-files.txt" || true
             exit 51
@@ -533,8 +682,8 @@ jobs:
 
       - name: Upload final ZIP directly
         id: upload_success
-        if: steps.unity_build.outcome == 'success' && steps.package.outcome == 'success'
-        uses: actions/upload-artifact@v7
+        if: steps.unity_result.outputs.final_outcome == 'success' && steps.package.outcome == 'success'
+        uses: actions/upload-artifact@v7.0.1
         with:
           path: .menchino-ci/package/Menchino-Android-Latest.zip
           archive: false
@@ -543,7 +692,7 @@ jobs:
 
       - name: Delete previous Menchino artifacts and completed runs
         id: cleanup
-        if: steps.unity_build.outcome == 'success' && steps.package.outcome == 'success'
+        if: steps.unity_result.outputs.final_outcome == 'success' && steps.package.outcome == 'success'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -617,7 +766,7 @@ jobs:
           done < "$LOG_DIR/old-run-ids.txt"
 
       - name: Collect sanitized failure logs
-        if: ${{ always() && (failure() || steps.unity_build.outcome != 'success' || steps.package.outcome != 'success') }}
+        if: ${{ always() && (failure() || steps.unity_result.outputs.final_outcome != 'success' || steps.package.outcome != 'success') }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -633,7 +782,7 @@ jobs:
           fi
 
           FAILURE_DIR=".menchino-ci/failure-bundle"
-          FAILURE_ZIP=".menchino-ci/menchino-build-error-logs-wf13-run-${GITHUB_RUN_NUMBER}.zip"
+          FAILURE_ZIP=".menchino-ci/menchino-build-error-logs-wf14-run-${GITHUB_RUN_NUMBER}.zip"
           rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
           mkdir -p "$FAILURE_DIR"
 
@@ -669,7 +818,11 @@ jobs:
             echo "run_number=$GITHUB_RUN_NUMBER"
             echo "source_zip=${SOURCE_ZIP:-not-selected}"
             echo "source_version=${SOURCE_VERSION:-unknown}"
-            echo "unity_build_outcome=${{ steps.unity_build.outcome }}"
+            echo "unity_build_outcome=${{ steps.unity_result.outputs.final_outcome }}"
+            echo "unity_activation_mode=${{ steps.unity_result.outputs.activation_mode }}"
+            echo "unity_engine_exit_code=${{ steps.unity_result.outputs.engine_exit_code }}"
+            echo "unity_serial_attempt_outcome=${{ steps.unity_build_serial.outcome }}"
+            echo "unity_ulf_attempt_outcome=${{ steps.unity_build_ulf.outcome }}"
             echo "package_outcome=${{ steps.package.outcome }}"
             echo "cleanup_outcome=${{ steps.cleanup.outcome }}"
             echo "failed_stage=$(cat "$LOG_DIR/current-stage.txt" 2>/dev/null || echo unknown)"
@@ -682,6 +835,7 @@ jobs:
 
           root = Path('.menchino-ci/failure-bundle')
           protected_values = [
+              os.environ.get('UNITY_SERIAL', ''),
               os.environ.get('UNITY_EMAIL', ''),
               os.environ.get('UNITY_PASSWORD', ''),
               os.environ.get('UNITY_LICENSE', ''),
@@ -703,18 +857,18 @@ jobs:
           test -s "$FAILURE_ZIP"
           unzip -t "$FAILURE_ZIP"
 
-      - name: Upload WF-13 error-log ZIP directly
-        if: ${{ always() && (failure() || steps.unity_build.outcome != 'success' || steps.package.outcome != 'success') }}
-        uses: actions/upload-artifact@v7
+      - name: Upload WF-14 error-log ZIP directly
+        if: ${{ always() && (failure() || steps.unity_result.outputs.final_outcome != 'success' || steps.package.outcome != 'success') }}
+        uses: actions/upload-artifact@v7.0.1
         with:
-          path: .menchino-ci/menchino-build-error-logs-wf13-run-${{ github.run_number }}.zip
+          path: .menchino-ci/menchino-build-error-logs-wf14-run-${{ github.run_number }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
 
       - name: Mark unsuccessful build as failed
-        if: steps.unity_build.outcome != 'success' || steps.package.outcome != 'success'
+        if: steps.unity_result.outputs.final_outcome != 'success' || steps.package.outcome != 'success'
         shell: bash
         run: |
-          echo 'Menchino WF-13 failed. Download the WF-13 error-log ZIP artifact.'
+          echo 'Menchino WF-14 failed. Download the WF-14 error-log ZIP; it now contains serial/ULF engine exit diagnostics.'
           exit 1
