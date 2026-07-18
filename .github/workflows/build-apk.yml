@@ -1,8 +1,8 @@
-# Menchino Workflow Number: WF-11
-# Signature: MENCHINO-WF11-20260718-R1
-# Supersedes: WF-10
-name: Menchino Android Build WF-11
-run-name: "Menchino WF-11 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
+# Menchino Workflow Number: WF-12
+# Signature: MENCHINO-WF12-20260718-R1
+# Supersedes: WF-11
+name: Menchino Android Build WF-12
+run-name: "Menchino WF-12 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -12,19 +12,19 @@ on:
       - master
     paths:
       - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf11.yml'
+      - '.github/workflows/menchino-build-wf12.yml'
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: menchino-wf11-${{ github.ref }}
+  group: menchino-wf12-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_NUMBER: WF-11
-  WORKFLOW_SIGNATURE: MENCHINO-WF11-20260718-R1
+  WORKFLOW_NUMBER: WF-12
+  WORKFLOW_SIGNATURE: MENCHINO-WF12-20260718-R1
   PROJECT_DIR: .menchino-ci/project
   EXTRACT_DIR: .menchino-ci/extracted
   LOG_DIR: .menchino-ci/logs
@@ -33,7 +33,7 @@ env:
 
 jobs:
   build-android:
-    name: WF-11 build exactly two APKs
+    name: WF-12 build exactly two APKs
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -46,7 +46,7 @@ jobs:
           clean: true
           persist-credentials: true
 
-      - name: Bootstrap and verify WF-11 identity
+      - name: Bootstrap and verify WF-12 identity
         id: workflow_identity
         shell: bash
         run: |
@@ -55,7 +55,7 @@ jobs:
           mkdir -p "$LOG_DIR" "$PACKAGE_DIR"
           printf '%s\n' 'bootstrap-and-verify-workflow-identity' > "$LOG_DIR/current-stage.txt"
 
-          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/wf11-identity.log"
+          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/wf12-identity.log"
           from __future__ import annotations
 
           import hashlib
@@ -64,8 +64,8 @@ jobs:
           from pathlib import Path
 
           workflows_dir = Path('.github/workflows')
-          expected_name = 'name: Menchino Android Build WF-11'
-          expected_signature = 'WORKFLOW_SIGNATURE: MENCHINO-WF11-20260718-R1'
+          expected_name = 'name: Menchino Android Build WF-12'
+          expected_signature = 'WORKFLOW_SIGNATURE: MENCHINO-WF12-20260718-R1'
           candidates = []
 
           for path in sorted([*workflows_dir.glob('*.yml'), *workflows_dir.glob('*.yaml')]):
@@ -88,8 +88,8 @@ jobs:
           matches = [item for item in candidates if item['has_expected_name'] and item['has_expected_signature']]
           if len(matches) != 1:
               raise SystemExit(
-                  f'WF-11 identity check expected exactly one matching workflow file, found {len(matches)}. '
-                  'The file may use any .yml/.yaml filename, but its internal WF-11 name and signature must be intact.'
+                  f'WF-12 identity check expected exactly one matching workflow file, found {len(matches)}. '
+                  'The file may use any .yml/.yaml filename, but its internal WF-12 name and signature must be intact.'
               )
 
           selected = matches[0]
@@ -123,7 +123,7 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
             echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } | tee "$LOG_DIR/wf11-identity.txt"
+          } | tee "$LOG_DIR/wf12-identity.txt"
 
       - name: Pull and verify Git LFS objects
         shell: bash
@@ -339,9 +339,16 @@ jobs:
           test -s "$PROJECT_DIR/.unity-ci/Unity_lic.ulf"
           test -s "$PROJECT_DIR/.unity-ci/unity_credentials.env"
           test -s "$PROJECT_DIR/Assets/Editor/MenchinoBuildConfigurator.cs"
+          test -s "$PROJECT_DIR/Assets/Scripts/Menchino.Runtime.asmdef"
           grep -Fq 'public static void Build()' "$PROJECT_DIR/Assets/Editor/MenchinoBuildConfigurator.cs"
           grep -Fq 'Menchino-arm64-v8a.apk' "$PROJECT_DIR/Assets/Editor/MenchinoBuildConfigurator.cs"
           grep -Fq 'Menchino-universal.apk' "$PROJECT_DIR/Assets/Editor/MenchinoBuildConfigurator.cs"
+          grep -Fq 'com.unity.ugui' "$PROJECT_DIR/Packages/manifest.json"
+          grep -Fq 'Unity.ugui' "$PROJECT_DIR/Assets/Scripts/Menchino.Runtime.asmdef"
+          if grep -Fq 'UnityEngine.Rendering.Universal' "$PROJECT_DIR/Assets/Editor/MenchinoBuildConfigurator.cs"; then
+            echo 'The obsolete runtime-generated URP build configuration is still present.' >&2
+            exit 32
+          fi
 
           {
             echo "source_zip=$SOURCE_ZIP"
@@ -404,7 +411,7 @@ jobs:
                   output.write(f'{key}<<{delimiter}\n{value}\n{delimiter}\n')
 
           Path(os.environ['LOG_DIR'], 'activation-validation.txt').write_text(
-              'workflow=WF-11\n'
+              'workflow=WF-12\n'
               'license_xml=valid\n'
               f'license_bytes={len(license_text.encode("utf-8"))}\n'
               f'license_sha256={hashlib.sha256(license_text.encode("utf-8")).hexdigest()}\n'
@@ -422,7 +429,15 @@ jobs:
           test -n "${UNITY_LICENSE:-}"
           test -n "${UNITY_EMAIL:-}"
           test -n "${UNITY_PASSWORD:-}"
-          echo 'WF-11 activation variables are available to Unity Builder.' | tee -a "$LOG_DIR/activation-validation.txt"
+          echo 'WF-12 activation variables are available to Unity Builder.' | tee -a "$LOG_DIR/activation-validation.txt"
+
+      - name: Prepare WF-12 Unity build diagnostics
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf '%s\n' 'unity-build' > "$LOG_DIR/current-stage.txt"
+          rm -rf "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs"
+          mkdir -p "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs"
 
       - name: Build arm64 and universal APKs
         id: unity_build
@@ -437,7 +452,6 @@ jobs:
           versioning: "None"
           allowDirtyBuild: true
           customParameters: >-
-            -logFile /github/workspace/.menchino-ci/logs/unity-builder.log
             -stackTraceLogType Full
 
       - name: Verify APKs and create final ZIP
@@ -446,12 +460,16 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          printf '%s\n' 'verify-and-package-apks' > "$LOG_DIR/current-stage.txt"
 
           if [ "${{ steps.unity_build.outcome }}" != 'success' ]; then
+            printf '%s\n' 'unity-build-failed' > "$LOG_DIR/current-stage.txt"
             echo "Unity Builder outcome=${{ steps.unity_build.outcome }}" | tee "$LOG_DIR/unity-builder-outcome.txt"
+            find "$PROJECT_DIR/Builds/Logs" -maxdepth 2 -type f -printf '%p %s bytes\n' 2>/dev/null \
+              | sort | tee "$LOG_DIR/unity-project-log-files.txt" || true
             exit 51
           fi
+
+          printf '%s\n' 'verify-and-package-apks' > "$LOG_DIR/current-stage.txt"
 
           BUILD_DIR="$PROJECT_DIR/Builds/Android"
           ARM64_APK="$BUILD_DIR/Menchino-arm64-v8a.apk"
@@ -605,13 +623,26 @@ jobs:
           fi
 
           FAILURE_DIR=".menchino-ci/failure-bundle"
-          FAILURE_ZIP=".menchino-ci/menchino-build-error-logs-wf11-run-${GITHUB_RUN_NUMBER}.zip"
+          FAILURE_ZIP=".menchino-ci/menchino-build-error-logs-wf12-run-${GITHUB_RUN_NUMBER}.zip"
           rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
           mkdir -p "$FAILURE_DIR"
 
           cp -a "$LOG_DIR"/. "$FAILURE_DIR"/ 2>/dev/null || true
           cp -a "$PROJECT_DIR/Builds/Logs" "$FAILURE_DIR/project-build-logs" 2>/dev/null || true
           cp -a "$PROJECT_DIR/Library/Logs" "$FAILURE_DIR/library-logs" 2>/dev/null || true
+          mkdir -p "$FAILURE_DIR/discovered-project-logs"
+          find "$PROJECT_DIR" -type f \
+            \( -name '*.log' -o -name '*build-report*.txt' -o -name '*build-report*.log' \
+               -o -name 'gradle*.txt' -o -name 'build.gradle' -o -name 'settings.gradle' \) \
+            -size -20M -print0 2>/dev/null \
+            | while IFS= read -r -d '' log_file; do
+                relative="${log_file#${PROJECT_DIR}/}"
+                target="$FAILURE_DIR/discovered-project-logs/$relative"
+                mkdir -p "$(dirname "$target")"
+                cp -a "$log_file" "$target" 2>/dev/null || true
+              done
+          find "$FAILURE_DIR/discovered-project-logs" -type f -printf '%P %s bytes\n' \
+            | sort > "$FAILURE_DIR/discovered-project-logs-index.txt" 2>/dev/null || true
           cp -a "$HOME/.local/share/unity3d/Unity/Editor.log" "$FAILURE_DIR/Editor.log" 2>/dev/null || true
           cp -a "$HOME/.local/share/unity3d/Unity/Editor-prev.log" "$FAILURE_DIR/Editor-prev.log" 2>/dev/null || true
           docker ps -a > "$FAILURE_DIR/docker-ps.txt" 2>&1 || true
@@ -662,11 +693,11 @@ jobs:
           test -s "$FAILURE_ZIP"
           unzip -t "$FAILURE_ZIP"
 
-      - name: Upload WF-11 error-log ZIP directly
+      - name: Upload WF-12 error-log ZIP directly
         if: ${{ always() && (failure() || steps.unity_build.outcome != 'success' || steps.package.outcome != 'success') }}
         uses: actions/upload-artifact@v7
         with:
-          path: .menchino-ci/menchino-build-error-logs-wf11-run-${{ github.run_number }}.zip
+          path: .menchino-ci/menchino-build-error-logs-wf12-run-${{ github.run_number }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
@@ -675,5 +706,5 @@ jobs:
         if: steps.unity_build.outcome != 'success' || steps.package.outcome != 'success'
         shell: bash
         run: |
-          echo 'Menchino WF-11 failed. Download the WF-11 error-log ZIP artifact.'
+          echo 'Menchino WF-12 failed. Download the WF-12 error-log ZIP artifact.'
           exit 1
