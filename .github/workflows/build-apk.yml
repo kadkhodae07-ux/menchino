@@ -1,12 +1,17 @@
-name: Build Menchino Android Latest
+name: Build Menchino Android Automatically
+run-name: "Menchino Android Auto Build #${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
+      - master
     paths:
       - 'menchino_unity_v*.zip'
+      - 'menchino_unity_*.zip'
+      - '.github/workflows/build-apk.yml'
       - '.github/workflows/menchino_unity_android_build_latest.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -231,34 +236,76 @@ jobs:
             echo "project_file_count=$(find "$PROJECT_PATH" -type f | wc -l)"
           } | tee "$LOG_PATH/source-validation.txt"
 
-      - name: Load embedded Unity license securely
+      - name: Load embedded Unity license for GameCI
+        id: embedded-license
         shell: bash
         run: |
           set -euo pipefail
           LICENSE_FILE="$PROJECT_PATH/.unity-ci/Unity_lic.ulf"
+          echo "license-load" > "$LOG_PATH/current-stage.txt"
 
           python3 - <<'PY'
           import os
+          import xml.etree.ElementTree as ET
           from pathlib import Path
 
           path = Path(os.environ['PROJECT_PATH']) / '.unity-ci' / 'Unity_lic.ulf'
           data = path.read_bytes()
           if len(data) < 256 or not data.lstrip().startswith(b'<') or b'License' not in data:
               raise SystemExit('Embedded Unity license is missing or structurally invalid.')
-          print('Embedded Unity license is structurally valid.')
+          ET.fromstring(data)
+          print('Embedded Unity license is structurally valid XML.')
           PY
 
           while IFS= read -r line || [ -n "$line" ]; do
             [ -z "$line" ] || echo "::add-mask::$line"
           done < "$LICENSE_FILE"
 
-          DELIMITER="UNITY_LICENSE_$(date +%s%N)"
+          DELIMITER="UNITY_LICENSE_$(date +%s%N)_${RANDOM}"
           {
-            echo "UNITY_LICENSE<<$DELIMITER"
+            echo "unity_license<<$DELIMITER"
             cat "$LICENSE_FILE"
             echo
             echo "$DELIMITER"
-          } >> "$GITHUB_ENV"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "embedded_license_path=$LICENSE_FILE"
+            echo "embedded_license_bytes=$(wc -c < "$LICENSE_FILE")"
+            echo "embedded_license_xml=valid"
+          } > "$LOG_PATH/license-load.txt"
+
+      - name: Validate Unity account credentials
+        shell: bash
+        env:
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "unity-credentials-preflight" > "$LOG_PATH/current-stage.txt"
+
+          missing=0
+          if [ -z "${UNITY_EMAIL:-}" ]; then
+            echo "UNITY_EMAIL secret is missing." | tee "$LOG_PATH/license-preflight.txt"
+            echo "::error::GitHub Actions secret UNITY_EMAIL is required by GameCI for Unity Personal reactivation."
+            missing=1
+          else
+            echo "UNITY_EMAIL secret is configured." > "$LOG_PATH/license-preflight.txt"
+          fi
+
+          if [ -z "${UNITY_PASSWORD:-}" ]; then
+            echo "UNITY_PASSWORD secret is missing." | tee -a "$LOG_PATH/license-preflight.txt"
+            echo "::error::GitHub Actions secret UNITY_PASSWORD is required by GameCI for Unity Personal reactivation."
+            missing=1
+          else
+            echo "UNITY_PASSWORD secret is configured." >> "$LOG_PATH/license-preflight.txt"
+          fi
+
+          echo "Embedded UNITY_LICENSE is loaded from the selected source ZIP." >> "$LOG_PATH/license-preflight.txt"
+
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: Restore Unity Library cache
         uses: actions/cache@v5
@@ -268,9 +315,17 @@ jobs:
           restore-keys: |
             menchino-library-${{ runner.os }}-
 
+      - name: Mark Unity test stage
+        shell: bash
+        run: echo "unity-editmode-tests" > "$LOG_PATH/current-stage.txt"
+
       - name: Run EditMode tests
         id: unity-tests
         uses: game-ci/unity-test-runner@v4
+        env:
+          UNITY_LICENSE: ${{ steps.embedded-license.outputs.unity_license }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         with:
           githubToken: ${{ secrets.GITHUB_TOKEN }}
           projectPath: .ci/unity-project
@@ -281,9 +336,17 @@ jobs:
             -logFile /github/workspace/.ci/failure-logs/unity-tests.log
             -stackTraceLogType Full
 
+      - name: Mark Unity build stage
+        shell: bash
+        run: echo "unity-android-dual-apk-build" > "$LOG_PATH/current-stage.txt"
+
       - name: Build two Android APK files
         id: unity-build
         uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ steps.embedded-license.outputs.unity_license }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         with:
           projectPath: .ci/unity-project
           unityVersion: auto
@@ -298,6 +361,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "verify-and-package-two-apks" > "$LOG_PATH/current-stage.txt"
           BUILD_DIR="$PROJECT_PATH/Builds/Android"
           rm -rf "$PACKAGE_PATH"
           mkdir -p "$PACKAGE_PATH"
@@ -363,6 +427,54 @@ jobs:
             echo "  - \`Menchino-universal.apk\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Delete all previous Menchino artifacts and completed runs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          echo "purge-previous-artifacts-and-runs" > "$LOG_PATH/current-stage.txt"
+
+          mapfile -t OLD_ARTIFACT_IDS < <(
+            gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+              --jq '.artifacts[] | select((.name | ascii_downcase) | startswith("menchino")) | .id'
+          )
+
+          for artifact_id in "${OLD_ARTIFACT_IDS[@]:-}"; do
+            [ -z "$artifact_id" ] && continue
+            echo "Deleting previous Menchino artifact: $artifact_id"
+            gh api --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
+          done
+
+          mapfile -t OLD_RUN_IDS < <(
+            gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100" \
+              --jq ".workflow_runs[] | select((.id | tostring) != \"${CURRENT_RUN_ID}\") | select(.status == \"completed\") | select((.name | ascii_downcase) | contains(\"menchino\")) | .id"
+          )
+
+          for run_id in "${OLD_RUN_IDS[@]:-}"; do
+            [ -z "$run_id" ] && continue
+            echo "Deleting previous completed Menchino workflow run: $run_id"
+            gh api --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id"
+          done
+
+          {
+            echo "previous_artifacts_deleted=${#OLD_ARTIFACT_IDS[@]}"
+            echo "previous_runs_deleted=${#OLD_RUN_IDS[@]}"
+          } > "$LOG_PATH/cleanup-summary.txt"
+
       - name: Upload final ZIP as the only success artifact
         id: upload-final
         uses: actions/upload-artifact@v7
@@ -372,67 +484,22 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Delete previous Menchino artifacts and completed workflow runs
+      - name: Record successful completion
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_ARTIFACT_ID: ${{ steps.upload-final.outputs.artifact-id }}
-          CURRENT_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-
-          echo "Keeping current artifact ID: $CURRENT_ARTIFACT_ID"
-          echo "Keeping current workflow run ID: $CURRENT_RUN_ID"
-
-          mapfile -t OLD_ARTIFACT_IDS < <(
-            gh api --paginate \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
-              --jq ".artifacts[] | select((.id | tostring) != \"$CURRENT_ARTIFACT_ID\") | select((.name | ascii_downcase) | startswith(\"menchino\")) | .id"
-          )
-
-          for artifact_id in "${OLD_ARTIFACT_IDS[@]:-}"; do
-            [ -z "$artifact_id" ] && continue
-            echo "Deleting old Menchino artifact: $artifact_id"
-            gh api --method DELETE \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
-          done
-
-          mapfile -t OLD_RUN_IDS < <(
-            gh api --paginate \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100" \
-              --jq ".workflow_runs[] | select((.id | tostring) != \"$CURRENT_RUN_ID\") | select(.status == \"completed\") | select((.name | ascii_downcase) | contains(\"menchino\")) | .id"
-          )
-
-          for run_id in "${OLD_RUN_IDS[@]:-}"; do
-            [ -z "$run_id" ] && continue
-            echo "Deleting old completed Menchino workflow run: $run_id"
-            gh api --method DELETE \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id"
-          done
-
-      - name: Remove current output artifact if post-upload cleanup fails
-        if: failure() && steps.upload-final.outcome == 'success'
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_ARTIFACT_ID: ${{ steps.upload-final.outputs.artifact-id }}
-        run: |
-          set -euo pipefail
-          if [ -n "${CURRENT_ARTIFACT_ID:-}" ]; then
-            echo "Removing current output artifact because the workflow failed after upload."
-            gh api --method DELETE \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "repos/$GITHUB_REPOSITORY/actions/artifacts/$CURRENT_ARTIFACT_ID"
-          fi
+          echo "success" > "$LOG_PATH/current-stage.txt"
+          {
+            echo
+            echo "- Previous Menchino artifacts and completed runs were deleted."
+            echo "- Current direct artifact: `Menchino-Android-Latest.zip`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect sanitized failure diagnostics
         if: failure()
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set +e
           BUNDLE=.ci/failure-bundle
@@ -443,6 +510,12 @@ jobs:
           cp -a "$TEST_PATH" "$BUNDLE/test-results" 2>/dev/null || true
           cp -a "$PROJECT_PATH/Builds/Logs" "$BUNDLE/build-logs" 2>/dev/null || true
           cp -a "$PROJECT_PATH/Logs" "$BUNDLE/project-logs" 2>/dev/null || true
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+            > "$BUNDLE/github-jobs.json" 2> "$BUNDLE/github-jobs-api-error.txt" || true
 
           for editor_log in \
             "$HOME/.config/unity3d/Editor.log" \
@@ -459,6 +532,10 @@ jobs:
             echo "source_zip=${SOURCE_ZIP:-not-selected}"
             echo "source_version=${SOURCE_VERSION:-unknown}"
             echo "source_sha256=${SOURCE_SHA256:-unknown}"
+            echo "failed_stage=$(cat "$LOG_PATH/current-stage.txt" 2>/dev/null || echo unknown)"
+            echo
+            echo "License preflight:"
+            cat "$LOG_PATH/license-preflight.txt" 2>/dev/null || echo "not reached"
             echo
             echo "Disk usage:"
             df -h
