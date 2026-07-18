@@ -1,5 +1,8 @@
-name: Menchino Android Build WF-10
-run-name: "Menchino WF-10 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
+# Menchino Workflow Number: WF-11
+# Signature: MENCHINO-WF11-20260718-R1
+# Supersedes: WF-10
+name: Menchino Android Build WF-11
+run-name: "Menchino WF-11 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -9,19 +12,19 @@ on:
       - master
     paths:
       - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf10.yml'
+      - '.github/workflows/menchino-build-wf11.yml'
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: menchino-wf10-${{ github.ref }}
+  group: menchino-wf11-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_NUMBER: WF-10
-  WORKFLOW_SIGNATURE: MENCHINO-WF10-20260718-R1
+  WORKFLOW_NUMBER: WF-11
+  WORKFLOW_SIGNATURE: MENCHINO-WF11-20260718-R1
   PROJECT_DIR: .menchino-ci/project
   EXTRACT_DIR: .menchino-ci/extracted
   LOG_DIR: .menchino-ci/logs
@@ -30,7 +33,7 @@ env:
 
 jobs:
   build-android:
-    name: WF-10 build exactly two APKs
+    name: WF-11 build exactly two APKs
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -41,39 +44,106 @@ jobs:
           fetch-depth: 0
           lfs: true
           clean: true
-          persist-credentials: false
+          persist-credentials: true
 
-      - name: Verify WF-10 identity
+      - name: Bootstrap and verify WF-11 identity
+        id: workflow_identity
         shell: bash
         run: |
           set -Eeuo pipefail
           rm -rf .menchino-ci
           mkdir -p "$LOG_DIR" "$PACKAGE_DIR"
+          printf '%s\n' 'bootstrap-and-verify-workflow-identity' > "$LOG_DIR/current-stage.txt"
 
-          WORKFLOW_FILE=".github/workflows/menchino-build-wf10.yml"
-          test -s "$WORKFLOW_FILE"
-          grep -Fq 'name: Menchino Android Build WF-10' "$WORKFLOW_FILE"
-          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF10-20260718-R1' "$WORKFLOW_FILE"
+          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/wf11-identity.log"
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          workflows_dir = Path('.github/workflows')
+          expected_name = 'name: Menchino Android Build WF-11'
+          expected_signature = 'WORKFLOW_SIGNATURE: MENCHINO-WF11-20260718-R1'
+          candidates = []
+
+          for path in sorted([*workflows_dir.glob('*.yml'), *workflows_dir.glob('*.yaml')]):
+              text = path.read_text(encoding='utf-8', errors='replace')
+              has_name = expected_name in text
+              has_signature = expected_signature in text
+              candidates.append({
+                  'path': path.as_posix(),
+                  'has_expected_name': has_name,
+                  'has_expected_signature': has_signature,
+                  'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+              })
+
+          Path(os.environ['LOG_DIR'], 'workflow-candidates.json').write_text(
+              json.dumps(candidates, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          print(json.dumps(candidates, ensure_ascii=False, indent=2))
+
+          matches = [item for item in candidates if item['has_expected_name'] and item['has_expected_signature']]
+          if len(matches) != 1:
+              raise SystemExit(
+                  f'WF-11 identity check expected exactly one matching workflow file, found {len(matches)}. '
+                  'The file may use any .yml/.yaml filename, but its internal WF-11 name and signature must be intact.'
+              )
+
+          selected = matches[0]
+          workflow_path = selected['path']
+          workflow_sha = selected['sha256']
+          print(f'ACTIVE_WORKFLOW_FILE={workflow_path}')
+          print(f'ACTIVE_WORKFLOW_SHA256={workflow_sha}')
+
+          env_path = Path(os.environ['LOG_DIR'], 'workflow-selection.env')
+          env_path.write_text(
+              f'ACTIVE_WORKFLOW_FILE={workflow_path}\n'
+              f'ACTIVE_WORKFLOW_SHA256={workflow_sha}\n',
+              encoding='utf-8',
+          )
+          PY
+
+          source "$LOG_DIR/workflow-selection.env"
+          {
+            echo "ACTIVE_WORKFLOW_FILE=$ACTIVE_WORKFLOW_FILE"
+            echo "ACTIVE_WORKFLOW_SHA256=$ACTIVE_WORKFLOW_SHA256"
+          } >> "$GITHUB_ENV"
 
           {
             echo "workflow_number=$WORKFLOW_NUMBER"
             echo "workflow_signature=$WORKFLOW_SIGNATURE"
-            echo "workflow_file=$WORKFLOW_FILE"
-            echo "workflow_sha256=$(sha256sum "$WORKFLOW_FILE" | awk '{print $1}')"
+            echo "workflow_file=$ACTIVE_WORKFLOW_FILE"
+            echo "workflow_sha256=$ACTIVE_WORKFLOW_SHA256"
             echo "run_id=$GITHUB_RUN_ID"
             echo "run_number=$GITHUB_RUN_NUMBER"
             echo "repository=$GITHUB_REPOSITORY"
             echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
             echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } | tee "$LOG_DIR/wf10-identity.txt"
+          } | tee "$LOG_DIR/wf11-identity.txt"
 
-      - name: Pull Git LFS objects
+      - name: Pull and verify Git LFS objects
         shell: bash
         run: |
           set -Eeuo pipefail
-          git lfs install --local
-          git lfs pull 2>&1 | tee "$LOG_DIR/git-lfs.log"
+          printf '%s\n' 'pull-and-verify-git-lfs' > "$LOG_DIR/current-stage.txt"
+          if git lfs version >/dev/null 2>&1; then
+            git lfs install --local
+            git lfs pull 2>&1 | tee "$LOG_DIR/git-lfs.log"
+          else
+            echo 'git-lfs is not installed on this runner.' | tee "$LOG_DIR/git-lfs.log"
+            exit 20
+          fi
+
+          if grep -RIl --exclude-dir=.git --exclude-dir=.menchino-ci \
+              '^version https://git-lfs.github.com/spec/v1$' . > "$LOG_DIR/unresolved-lfs-pointers.txt"; then
+            echo 'Unresolved Git LFS pointer files remain after checkout/pull:' | tee -a "$LOG_DIR/git-lfs.log"
+            cat "$LOG_DIR/unresolved-lfs-pointers.txt" | tee -a "$LOG_DIR/git-lfs.log"
+            exit 21
+          fi
 
       - name: Find and validate latest Menchino source ZIP
         id: source
@@ -334,7 +404,7 @@ jobs:
                   output.write(f'{key}<<{delimiter}\n{value}\n{delimiter}\n')
 
           Path(os.environ['LOG_DIR'], 'activation-validation.txt').write_text(
-              'workflow=WF-10\n'
+              'workflow=WF-11\n'
               'license_xml=valid\n'
               f'license_bytes={len(license_text.encode("utf-8"))}\n'
               f'license_sha256={hashlib.sha256(license_text.encode("utf-8")).hexdigest()}\n'
@@ -352,7 +422,7 @@ jobs:
           test -n "${UNITY_LICENSE:-}"
           test -n "${UNITY_EMAIL:-}"
           test -n "${UNITY_PASSWORD:-}"
-          echo 'WF-10 activation variables are available to Unity Builder.' | tee -a "$LOG_DIR/activation-validation.txt"
+          echo 'WF-11 activation variables are available to Unity Builder.' | tee -a "$LOG_DIR/activation-validation.txt"
 
       - name: Build arm64 and universal APKs
         id: unity_build
@@ -535,7 +605,7 @@ jobs:
           fi
 
           FAILURE_DIR=".menchino-ci/failure-bundle"
-          FAILURE_ZIP=".menchino-ci/menchino-build-error-logs-wf10-run-${GITHUB_RUN_NUMBER}.zip"
+          FAILURE_ZIP=".menchino-ci/menchino-build-error-logs-wf11-run-${GITHUB_RUN_NUMBER}.zip"
           rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
           mkdir -p "$FAILURE_DIR"
 
@@ -552,6 +622,8 @@ jobs:
             echo "workflow_number=$WORKFLOW_NUMBER"
             echo "workflow_signature=$WORKFLOW_SIGNATURE"
             echo "workflow=$GITHUB_WORKFLOW"
+            echo "active_workflow_file=${ACTIVE_WORKFLOW_FILE:-unknown}"
+            echo "active_workflow_sha256=${ACTIVE_WORKFLOW_SHA256:-unknown}"
             echo "run_id=$GITHUB_RUN_ID"
             echo "run_number=$GITHUB_RUN_NUMBER"
             echo "source_zip=${SOURCE_ZIP:-not-selected}"
@@ -590,11 +662,11 @@ jobs:
           test -s "$FAILURE_ZIP"
           unzip -t "$FAILURE_ZIP"
 
-      - name: Upload WF-10 error-log ZIP directly
+      - name: Upload WF-11 error-log ZIP directly
         if: ${{ always() && (failure() || steps.unity_build.outcome != 'success' || steps.package.outcome != 'success') }}
         uses: actions/upload-artifact@v7
         with:
-          path: .menchino-ci/menchino-build-error-logs-wf10-run-${{ github.run_number }}.zip
+          path: .menchino-ci/menchino-build-error-logs-wf11-run-${{ github.run_number }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
@@ -603,5 +675,5 @@ jobs:
         if: steps.unity_build.outcome != 'success' || steps.package.outcome != 'success'
         shell: bash
         run: |
-          echo 'Menchino WF-10 failed. Download the WF-10 error-log ZIP artifact.'
+          echo 'Menchino WF-11 failed. Download the WF-11 error-log ZIP artifact.'
           exit 1
