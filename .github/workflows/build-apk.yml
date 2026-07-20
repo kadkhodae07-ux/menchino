@@ -1,8 +1,8 @@
-# Menchino Workflow Number: WF-17
-# Signature: MENCHINO-WF17-20260720-R1
-# Supersedes: WF-16
-name: Menchino Android Build WF-17 High-Capacity Docker Storage
-run-name: "Menchino WF-17 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
+# Menchino Workflow Number: WF-18
+# Signature: MENCHINO-WF18-20260720-R1
+# Supersedes: WF-17
+name: Menchino Android Build WF-18 Clean Online License Activation
+run-name: "Menchino WF-18 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -12,19 +12,19 @@ on:
       - master
     paths:
       - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf17.yml'
+      - '.github/workflows/menchino-build-wf18.yml'
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: menchino-wf17-storage-${{ github.ref }}
+  group: menchino-wf18-clean-activation-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_NUMBER: WF-17
-  WORKFLOW_SIGNATURE: MENCHINO-WF17-20260720-R1
+  WORKFLOW_NUMBER: WF-18
+  WORKFLOW_SIGNATURE: MENCHINO-WF18-20260720-R1
   CI_ROOT: /mnt/menchino-ci
   PROJECT_DIR: /mnt/menchino-ci/project
   EXTRACT_DIR: /mnt/menchino-ci/extracted
@@ -35,7 +35,7 @@ env:
 
 jobs:
   build-android:
-    name: WF-17 high-capacity-storage dual APK build
+    name: WF-18 clean-activation dual APK build
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
@@ -125,9 +125,9 @@ jobs:
           echo '=== Disk state after relocation ==='
           df -hT / /mnt /var/lib/docker /var/lib/containerd "$GITHUB_WORKSPACE"
           docker info --format '{{json .}}' > "$LOG_DIR/docker-info-after-relocation.json"
-          echo 'WF-17 high-capacity storage preparation passed.'
+          echo 'WF-18 high-capacity storage preparation passed.'
 
-      - name: Bootstrap and verify WF-17 identity dynamically
+      - name: Bootstrap and verify WF-18 identity dynamically
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -163,14 +163,14 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
             echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } | tee "$LOG_DIR/wf17-identity.txt"
+          } | tee "$LOG_DIR/wf18-identity.txt"
 
-          grep -Fq 'name: Menchino Android Build WF-17 High-Capacity Docker Storage' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_NUMBER: WF-17' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF17-20260720-R1' "$WORKFLOW_PATH"
-          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf17-workflow-sha256.txt"
+          grep -Fq 'name: Menchino Android Build WF-18 Clean Online License Activation' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_NUMBER: WF-18' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF18-20260720-R1' "$WORKFLOW_PATH"
+          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf18-workflow-sha256.txt"
           printf '%s\n' "$WORKFLOW_PATH" > "$LOG_DIR/executed-workflow-path.txt"
-          echo 'WF-17 bootstrap identity verification passed.'
+          echo 'WF-18 bootstrap identity verification passed.'
 
       - name: Pull and verify Git LFS objects
         shell: bash
@@ -455,8 +455,8 @@ jobs:
           runtime_env.chmod(0o600)
 
           (logs / 'activation-validation.txt').write_text(
-              'workflow=WF-17\n'
-              'activation_strategy=direct-ulf-import;direct-copy;online-fallback\n'
+              'workflow=WF-18\n'
+              'activation_strategy=clean-home;online-personal-activation;single-container-build\n'
               'game_ci_builder_used=false\n'
               'github_unity_secrets_used=false\n'
               f'license_bytes={len(license_text.encode("utf-8"))}\n'
@@ -506,16 +506,20 @@ jobs:
             df -hT / /mnt /var/lib/docker /var/lib/containerd
           } | tee "$LOG_DIR/docker-storage-after-pull.txt"
 
-      - name: Build exactly two APKs in direct Unity container
+      - name: Build exactly two APKs with clean online activation
         id: unity_build
         shell: bash
         run: |
           set -Eeuo pipefail
-          printf '%s\n' 'direct-unity-container-build' > "$LOG_DIR/current-stage.txt"
+          printf '%s\n' 'clean-online-activation-and-build' > "$LOG_DIR/current-stage.txt"
           rm -rf "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs" "$CI_ROOT/unity-home"
-          mkdir -p "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs" "$CI_ROOT/unity-home"
+          mkdir -p "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs"
+          mkdir -p "$CI_ROOT/unity-home/.cache/unity3d"
+          mkdir -p "$CI_ROOT/unity-home/.config/unity3d"
+          mkdir -p "$CI_ROOT/unity-home/.local/share/unity3d/Unity"
+          chmod -R u+rwX,go-rwx "$CI_ROOT/unity-home"
 
-          cat > "$CI_ROOT/run-unity-wf17.sh" <<'BASH'
+          cat > "$CI_ROOT/run-unity-wf18.sh" <<'BASH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -523,94 +527,123 @@ jobs:
           CI_MOUNT=/menchino-ci
           PROJECT="$CI_MOUNT/project"
           LOGS="$CI_MOUNT/logs"
-          LICENSE="$PROJECT/.unity-ci/Unity_lic.ulf"
-          LICENSE_HOME=/root/.local/share/unity3d/Unity
+          HOME=/root
+          export HOME
+          export XDG_CACHE_HOME=/root/.cache
+          export XDG_CONFIG_HOME=/root/.config
+          export XDG_DATA_HOME=/root/.local/share
 
-          mkdir -p "$LICENSE_HOME" "$LOGS" "$PROJECT/Builds/Android" "$PROJECT/Builds/Logs"
-          cp "$LICENSE" "$LICENSE_HOME/Unity_lic.ulf"
-          chmod 600 "$LICENSE_HOME/Unity_lic.ulf"
+          LICENSE_HOME=/root/.local/share/unity3d/Unity
+          mkdir -p \
+            /root/.cache/unity3d \
+            /root/.config/unity3d \
+            "$LICENSE_HOME" \
+            "$LOGS" \
+            "$PROJECT/Builds/Android" \
+            "$PROJECT/Builds/Logs"
+          chmod -R u+rwX,go-rwx /root/.cache /root/.config /root/.local
+
+          # The embedded ULF was generated for another machine. Never install it
+          # on the ephemeral runner. It is used only outside this script to
+          # decode the account serial. Remove every stale/invalid license copy
+          # before the online activation attempt.
+          find /root/.local/share/unity3d /root/.config/unity3d /root/.cache/unity3d \
+            -type f \( -iname 'Unity_lic.ulf' -o -iname '*.ulf' -o -iname '*license*.xml' \) \
+            -delete 2>/dev/null || true
+          rm -f \
+            /root/.local/share/unity3d/Unity/Unity_lic.ulf \
+            /root/.config/unity3d/Unity/Unity_lic.ulf \
+            2>/dev/null || true
+
+          {
+            echo "workflow=WF-18"
+            echo "home=$HOME"
+            echo "xdg_cache=$XDG_CACHE_HOME"
+            echo "xdg_config=$XDG_CONFIG_HOME"
+            echo "xdg_data=$XDG_DATA_HOME"
+            echo "stale_license_files_before_activation=0"
+            find /root/.local/share/unity3d /root/.config/unity3d /root/.cache/unity3d \
+              -type f -maxdepth 5 -printf '%p|%s\n' 2>/dev/null | sort || true
+          } > "$LOGS/clean-activation-preflight.txt"
 
           run_unity() {
             local label="$1"
             shift
-            echo "[WF-17] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-18] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             set +e
             xvfb-run -a "$UNITY_BIN" "$@"
             local code=$?
             set -e
-            echo "[WF-17] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-18] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             return "$code"
           }
 
-          MANUAL_EXIT=0
-          run_unity manual-license-import \
-            -batchmode -nographics -quit -force-free \
-            -manualLicenseFile "$LICENSE" \
-            -logFile "$LOGS/unity-manual-license.log" || MANUAL_EXIT=$?
-          echo "manual_license_exit=$MANUAL_EXIT" > "$LOGS/activation-attempts.txt"
-
-          BUILD1_EXIT=0
-          run_unity build-after-ulf \
-            -batchmode -nographics -quit -force-free \
-            -projectPath "$PROJECT" \
-            -buildTarget Android \
-            -executeMethod Menchino.Editor.AndroidBuilder.Build \
-            -stackTraceLogType Full \
-            -logFile "$LOGS/unity-build-ulf.log" || BUILD1_EXIT=$?
-          echo "build_after_ulf_exit=$BUILD1_EXIT" >> "$LOGS/activation-attempts.txt"
-
-          APK_COUNT=$(find "$PROJECT/Builds/Android" -maxdepth 1 -type f -name '*.apk' | wc -l | tr -d ' ')
-          if [ "$BUILD1_EXIT" -eq 0 ] && [ "$APK_COUNT" -eq 2 ]; then
-            echo 'activation_mode=embedded-ulf-direct' >> "$LOGS/activation-attempts.txt"
-            exit 0
-          fi
-
-          LICENSE_PATTERN='No valid Unity Editor license|No valid license|License is not active|Failed to activate|Licensing.*(fail|error)|LICENSE SYSTEM.*(fail|error)|serial.*(invalid|failed)|entitlement.*(missing|failed)|Machine identification is invalid'
-          NEED_ONLINE=false
-          if grep -Eiq "$LICENSE_PATTERN" "$LOGS/unity-manual-license.log" "$LOGS/unity-build-ulf.log" 2>/dev/null; then
-            NEED_ONLINE=true
-          elif [ ! -s "$LOGS/unity-build-ulf.log" ]; then
-            NEED_ONLINE=true
-          fi
-          echo "online_fallback_required=$NEED_ONLINE" >> "$LOGS/activation-attempts.txt"
-
-          if [ "$NEED_ONLINE" != true ]; then
-            echo 'activation_mode=ulf-build-reached-project-but-failed' >> "$LOGS/activation-attempts.txt"
-            exit "$BUILD1_EXIT"
-          fi
-
-          ONLINE_EXIT=0
-          run_unity online-personal-activation \
+          ACTIVATION_EXIT=0
+          run_unity online-personal-activation-clean-home \
             -batchmode -nographics -quit \
             -username "$UNITY_EMAIL" \
             -password "$UNITY_PASSWORD" \
             -serial "$UNITY_SERIAL" \
-            -logFile "$LOGS/unity-online-activation.log" || ONLINE_EXIT=$?
-          echo "online_activation_exit=$ONLINE_EXIT" >> "$LOGS/activation-attempts.txt"
+            -logFile "$LOGS/unity-online-activation-clean.log" || ACTIVATION_EXIT=$?
+          echo "online_activation_exit=$ACTIVATION_EXIT" > "$LOGS/activation-attempts.txt"
 
-          rm -rf "$PROJECT/Builds/Android" "$PROJECT/Builds/Logs"
-          mkdir -p "$PROJECT/Builds/Android" "$PROJECT/Builds/Logs"
+          {
+            echo "activation_exit=$ACTIVATION_EXIT"
+            echo "license_files_after_activation:"
+            find /root/.local/share/unity3d /root/.config/unity3d \
+              -type f -maxdepth 6 -printf '%p|%s\n' 2>/dev/null | sort || true
+          } > "$LOGS/license-state-after-activation.txt"
 
-          BUILD2_EXIT=0
-          run_unity build-after-online-activation \
+          ACTIVATED=false
+          if grep -Eiq \
+            'Successfully activated the entitlement license|License is successfully updated|License.*activated successfully' \
+            "$LOGS/unity-online-activation-clean.log" 2>/dev/null; then
+            ACTIVATED=true
+          fi
+          if find /root/.local/share/unity3d /root/.config/unity3d \
+              -type f \( -iname 'Unity_lic.ulf' -o -iname '*.ulf' -o -iname '*license*.xml' \) \
+              -size +100c -print -quit 2>/dev/null | grep -q .; then
+            ACTIVATED=true
+          fi
+          echo "activation_detected=$ACTIVATED" >> "$LOGS/activation-attempts.txt"
+
+          if [ "$ACTIVATION_EXIT" -ne 0 ] && [ "$ACTIVATED" != true ]; then
+            echo 'activation_mode=clean-online-activation-failed' >> "$LOGS/activation-attempts.txt"
+            exit "$ACTIVATION_EXIT"
+          fi
+
+          BUILD_EXIT=0
+          run_unity build-after-clean-online-activation \
             -batchmode -nographics -quit -force-free \
             -projectPath "$PROJECT" \
             -buildTarget Android \
             -executeMethod Menchino.Editor.AndroidBuilder.Build \
             -stackTraceLogType Full \
-            -logFile "$LOGS/unity-build-online.log" || BUILD2_EXIT=$?
-          echo "build_after_online_exit=$BUILD2_EXIT" >> "$LOGS/activation-attempts.txt"
+            -logFile "$LOGS/unity-build-clean-online.log" || BUILD_EXIT=$?
+          echo "build_after_online_exit=$BUILD_EXIT" >> "$LOGS/activation-attempts.txt"
 
           APK_COUNT=$(find "$PROJECT/Builds/Android" -maxdepth 1 -type f -name '*.apk' | wc -l | tr -d ' ')
-          if [ "$BUILD2_EXIT" -eq 0 ] && [ "$APK_COUNT" -eq 2 ]; then
-            echo 'activation_mode=online-fallback' >> "$LOGS/activation-attempts.txt"
-            exit 0
+          echo "apk_count=$APK_COUNT" >> "$LOGS/activation-attempts.txt"
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo 'activation_mode=clean-online-active-build-failed' >> "$LOGS/activation-attempts.txt"
+            exit "$BUILD_EXIT"
+          fi
+          if [ "$APK_COUNT" -ne 2 ]; then
+            echo 'activation_mode=clean-online-build-missing-apks' >> "$LOGS/activation-attempts.txt"
+            exit 72
           fi
 
-          echo 'activation_mode=all-direct-paths-failed' >> "$LOGS/activation-attempts.txt"
-          exit "$BUILD2_EXIT"
+          echo 'activation_mode=clean-online-activation-success' >> "$LOGS/activation-attempts.txt"
+
+          RETURN_EXIT=0
+          run_unity return-ephemeral-license \
+            -batchmode -nographics -quit \
+            -returnlicense \
+            -logFile "$LOGS/unity-return-license.log" || RETURN_EXIT=$?
+          echo "return_license_exit=$RETURN_EXIT" >> "$LOGS/activation-attempts.txt"
+          exit 0
           BASH
-          chmod +x "$CI_ROOT/run-unity-wf17.sh"
+          chmod +x "$CI_ROOT/run-unity-wf18.sh"
 
           set +e
           docker run --rm \
@@ -618,10 +651,14 @@ jobs:
             --shm-size=2g \
             --env-file "$CI_ROOT/runtime-unity.env" \
             -e HOME=/root \
+            -e XDG_CACHE_HOME=/root/.cache \
+            -e XDG_CONFIG_HOME=/root/.config \
+            -e XDG_DATA_HOME=/root/.local/share \
             -v "$CI_ROOT:/menchino-ci" \
+            -v "$CI_ROOT/unity-home:/root" \
             -w /menchino-ci \
             "$UNITY_IMAGE" \
-            bash /menchino-ci/run-unity-wf17.sh \
+            bash /menchino-ci/run-unity-wf18.sh \
             2>&1 | tee "$LOG_DIR/direct-unity-container-console.log"
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
@@ -765,7 +802,7 @@ jobs:
               "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" >/dev/null
           done < "$LOG_DIR/old-run-ids.txt"
 
-      - name: Collect sanitized WF-17 failure logs
+      - name: Collect sanitized WF-18 failure logs
         if: ${{ always() && failure() }}
         shell: bash
         env:
@@ -781,7 +818,7 @@ jobs:
           fi
 
           FAILURE_DIR="$CI_ROOT/failure-bundle"
-          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf17-run-${GITHUB_RUN_NUMBER}.zip"
+          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf18-run-${GITHUB_RUN_NUMBER}.zip"
           rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
           mkdir -p "$FAILURE_DIR"
 
@@ -857,12 +894,11 @@ jobs:
           test -s "$FAILURE_ZIP"
           unzip -t "$FAILURE_ZIP"
 
-      - name: Upload WF-17 error-log ZIP directly
+      - name: Upload WF-18 error-log ZIP directly
         if: ${{ always() && failure() }}
         uses: actions/upload-artifact@v7.0.1
         with:
-          path: /mnt/menchino-ci/menchino-build-error-logs-wf17-run-${{ github.run_number }}.zip
+          path: /mnt/menchino-ci/menchino-build-error-logs-wf18-run-${{ github.run_number }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
- 
