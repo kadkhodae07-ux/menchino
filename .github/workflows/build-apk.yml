@@ -1,8 +1,8 @@
-# Menchino Workflow Number: WF-18
-# Signature: MENCHINO-WF18-20260720-R1
-# Supersedes: WF-17
-name: Menchino Android Build WF-18 Clean Online License Activation
-run-name: "Menchino WF-18 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
+# Menchino Workflow Number: WF-19
+# Signature: MENCHINO-WF19-20260720-R1
+# Supersedes: WF-18
+name: Menchino Android Build WF-19 Dependency Preflight
+run-name: "Menchino WF-19 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -12,19 +12,19 @@ on:
       - master
     paths:
       - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf18.yml'
+      - '.github/workflows/menchino-build-wf19.yml'
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: menchino-wf18-clean-activation-${{ github.ref }}
+  group: menchino-wf19-dependency-preflight-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_NUMBER: WF-18
-  WORKFLOW_SIGNATURE: MENCHINO-WF18-20260720-R1
+  WORKFLOW_NUMBER: WF-19
+  WORKFLOW_SIGNATURE: MENCHINO-WF19-20260720-R1
   CI_ROOT: /mnt/menchino-ci
   PROJECT_DIR: /mnt/menchino-ci/project
   EXTRACT_DIR: /mnt/menchino-ci/extracted
@@ -35,7 +35,7 @@ env:
 
 jobs:
   build-android:
-    name: WF-18 clean-activation dual APK build
+    name: WF-19 dependency-validated dual APK build
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
@@ -125,9 +125,9 @@ jobs:
           echo '=== Disk state after relocation ==='
           df -hT / /mnt /var/lib/docker /var/lib/containerd "$GITHUB_WORKSPACE"
           docker info --format '{{json .}}' > "$LOG_DIR/docker-info-after-relocation.json"
-          echo 'WF-18 high-capacity storage preparation passed.'
+          echo 'WF-19 high-capacity storage preparation passed.'
 
-      - name: Bootstrap and verify WF-18 identity dynamically
+      - name: Bootstrap and verify WF-19 identity dynamically
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -163,14 +163,14 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
             echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } | tee "$LOG_DIR/wf18-identity.txt"
+          } | tee "$LOG_DIR/wf19-identity.txt"
 
-          grep -Fq 'name: Menchino Android Build WF-18 Clean Online License Activation' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_NUMBER: WF-18' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF18-20260720-R1' "$WORKFLOW_PATH"
-          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf18-workflow-sha256.txt"
+          grep -Fq 'name: Menchino Android Build WF-19 Dependency Preflight' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_NUMBER: WF-19' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF19-20260720-R1' "$WORKFLOW_PATH"
+          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf19-workflow-sha256.txt"
           printf '%s\n' "$WORKFLOW_PATH" > "$LOG_DIR/executed-workflow-path.txt"
-          echo 'WF-18 bootstrap identity verification passed.'
+          echo 'WF-19 bootstrap identity verification passed.'
 
       - name: Pull and verify Git LFS objects
         shell: bash
@@ -394,6 +394,77 @@ jobs:
             echo "project_file_count=$(find "$PROJECT_DIR" -type f | wc -l)"
           } | tee "$LOG_DIR/project-validation.txt"
 
+      - name: Validate Unity package modules and source dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf '%s\n' 'dependency-preflight' > "$LOG_DIR/current-stage.txt"
+          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/dependency-preflight.log"
+          from __future__ import annotations
+
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path(os.environ['PROJECT_DIR'])
+          manifest_path = project / 'Packages' / 'manifest.json'
+          asmdef_path = project / 'Assets' / 'Scripts' / 'Menchino.Runtime.asmdef'
+          scripts_root = project / 'Assets'
+
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+          dependencies = manifest.get('dependencies')
+          if not isinstance(dependencies, dict):
+              raise SystemExit('Packages/manifest.json has no dependencies object.')
+
+          required = {
+              'com.unity.ugui': 'UnityEngine.UI/EventSystems',
+              'com.unity.modules.androidjni': 'AndroidJavaClass/AndroidJavaObject',
+              'com.unity.modules.audio': 'AudioSource/AudioClip/AudioListener',
+              'com.unity.modules.imgui': 'GUIUtility clipboard fallback',
+              'com.unity.modules.inputlegacy': 'StandaloneInputModule',
+              'com.unity.modules.jsonserialize': 'JsonUtility',
+              'com.unity.modules.physics': 'Collider and primitive collider cleanup',
+              'com.unity.modules.ui': 'Canvas/CanvasRenderer',
+          }
+          missing = [name for name in required if dependencies.get(name) != '1.0.0']
+          if missing:
+              detail = ', '.join(f'{name} ({required[name]})' for name in missing)
+              raise SystemExit('Required Unity packages are missing or not pinned to 1.0.0: ' + detail)
+
+          source = '\n'.join(
+              path.read_text(encoding='utf-8', errors='replace')
+              for path in sorted(scripts_root.rglob('*.cs'))
+          )
+          evidence = {
+              'com.unity.modules.physics': [r'\bCollider\b'],
+              'com.unity.modules.audio': [r'\bAudioSource\b', r'\bAudioClip\b', r'\bAudioListener\b'],
+              'com.unity.modules.androidjni': [r'\bAndroidJavaClass\b', r'\bAndroidJavaObject\b'],
+              'com.unity.modules.imgui': [r'\bGUIUtility\b'],
+              'com.unity.modules.jsonserialize': [r'\bJsonUtility\b'],
+              'com.unity.modules.ui': [r'\bCanvas\b', r'\bCanvasRenderer\b'],
+              'com.unity.modules.inputlegacy': [r'\bStandaloneInputModule\b'],
+          }
+          for package_name, patterns in evidence.items():
+              hits = [pattern for pattern in patterns if re.search(pattern, source)]
+              if hits and package_name not in dependencies:
+                  raise SystemExit(
+                      f'Source uses {hits}, but {package_name} is absent from Packages/manifest.json.')
+
+          asmdef = json.loads(asmdef_path.read_text(encoding='utf-8'))
+          references = asmdef.get('references', [])
+          if 'Unity.ugui' not in references:
+              raise SystemExit('Menchino.Runtime.asmdef does not reference Unity.ugui.')
+
+          print('workflow=WF-19')
+          print('manifest_json=valid')
+          print('required_package_count=' + str(len(required)))
+          for package_name in sorted(required):
+              print(f'package={package_name};version={dependencies[package_name]};reason={required[package_name]}')
+          print('asmdef_unity_ugui_reference=present')
+          print('dependency_preflight=passed')
+          PY
+
       - name: Prepare embedded activation files
         shell: bash
         run: |
@@ -455,8 +526,8 @@ jobs:
           runtime_env.chmod(0o600)
 
           (logs / 'activation-validation.txt').write_text(
-              'workflow=WF-18\n'
-              'activation_strategy=clean-home;online-personal-activation;single-container-build\n'
+              'workflow=WF-19\n'
+              'activation_strategy=dependency-preflight;clean-home;online-personal-activation;single-container-build\n'
               'game_ci_builder_used=false\n'
               'github_unity_secrets_used=false\n'
               f'license_bytes={len(license_text.encode("utf-8"))}\n'
@@ -519,7 +590,7 @@ jobs:
           mkdir -p "$CI_ROOT/unity-home/.local/share/unity3d/Unity"
           chmod -R u+rwX,go-rwx "$CI_ROOT/unity-home"
 
-          cat > "$CI_ROOT/run-unity-wf18.sh" <<'BASH'
+          cat > "$CI_ROOT/run-unity-wf19.sh" <<'BASH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -556,7 +627,7 @@ jobs:
             2>/dev/null || true
 
           {
-            echo "workflow=WF-18"
+            echo "workflow=WF-19"
             echo "home=$HOME"
             echo "xdg_cache=$XDG_CACHE_HOME"
             echo "xdg_config=$XDG_CONFIG_HOME"
@@ -569,12 +640,12 @@ jobs:
           run_unity() {
             local label="$1"
             shift
-            echo "[WF-18] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-19] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             set +e
             xvfb-run -a "$UNITY_BIN" "$@"
             local code=$?
             set -e
-            echo "[WF-18] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-19] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             return "$code"
           }
 
@@ -643,7 +714,7 @@ jobs:
           echo "return_license_exit=$RETURN_EXIT" >> "$LOGS/activation-attempts.txt"
           exit 0
           BASH
-          chmod +x "$CI_ROOT/run-unity-wf18.sh"
+          chmod +x "$CI_ROOT/run-unity-wf19.sh"
 
           set +e
           docker run --rm \
@@ -658,7 +729,7 @@ jobs:
             -v "$CI_ROOT/unity-home:/root" \
             -w /menchino-ci \
             "$UNITY_IMAGE" \
-            bash /menchino-ci/run-unity-wf18.sh \
+            bash /menchino-ci/run-unity-wf19.sh \
             2>&1 | tee "$LOG_DIR/direct-unity-container-console.log"
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
@@ -802,7 +873,7 @@ jobs:
               "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" >/dev/null
           done < "$LOG_DIR/old-run-ids.txt"
 
-      - name: Collect sanitized WF-18 failure logs
+      - name: Collect sanitized WF-19 failure logs
         if: ${{ always() && failure() }}
         shell: bash
         env:
@@ -818,7 +889,7 @@ jobs:
           fi
 
           FAILURE_DIR="$CI_ROOT/failure-bundle"
-          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf18-run-${GITHUB_RUN_NUMBER}.zip"
+          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf19-run-${GITHUB_RUN_NUMBER}.zip"
           rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
           mkdir -p "$FAILURE_DIR"
 
@@ -894,11 +965,12 @@ jobs:
           test -s "$FAILURE_ZIP"
           unzip -t "$FAILURE_ZIP"
 
-      - name: Upload WF-18 error-log ZIP directly
+      - name: Upload WF-19 error-log ZIP directly
         if: ${{ always() && failure() }}
         uses: actions/upload-artifact@v7.0.1
         with:
-          path: /mnt/menchino-ci/menchino-build-error-logs-wf18-run-${{ github.run_number }}.zip
+          path: /mnt/menchino-ci/menchino-build-error-logs-wf19-run-${{ github.run_number }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
+ 
