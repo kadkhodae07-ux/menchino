@@ -1,8 +1,8 @@
-# Menchino Workflow Number: WF-20
-# Signature: MENCHINO-WF20-20260720-R1
-# Supersedes: WF-19
-name: Menchino Android Build WF-20 Valid Package Preflight
-run-name: "Menchino WF-20 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
+# Menchino Workflow Number: WF-21
+# Signature: MENCHINO-WF21-20260720-R1
+# Supersedes: WF-20
+name: Menchino Android Build WF-21 Runtime Shader Retention
+run-name: "Menchino WF-21 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -12,19 +12,19 @@ on:
       - master
     paths:
       - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf20.yml'
+      - '.github/workflows/menchino-build-wf21.yml'
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: menchino-wf20-valid-package-preflight-${{ github.ref }}
+  group: menchino-wf21-runtime-shader-retention-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_NUMBER: WF-20
-  WORKFLOW_SIGNATURE: MENCHINO-WF20-20260720-R1
+  WORKFLOW_NUMBER: WF-21
+  WORKFLOW_SIGNATURE: MENCHINO-WF21-20260720-R1
   CI_ROOT: /mnt/menchino-ci
   PROJECT_DIR: /mnt/menchino-ci/project
   EXTRACT_DIR: /mnt/menchino-ci/extracted
@@ -35,7 +35,7 @@ env:
 
 jobs:
   build-android:
-    name: WF-20 valid-package dual APK build
+    name: WF-21 runtime-shader dual APK build
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
@@ -125,9 +125,9 @@ jobs:
           echo '=== Disk state after relocation ==='
           df -hT / /mnt /var/lib/docker /var/lib/containerd "$GITHUB_WORKSPACE"
           docker info --format '{{json .}}' > "$LOG_DIR/docker-info-after-relocation.json"
-          echo 'WF-20 high-capacity storage preparation passed.'
+          echo 'WF-21 high-capacity storage preparation passed.'
 
-      - name: Bootstrap and verify WF-20 identity dynamically
+      - name: Bootstrap and verify WF-21 identity dynamically
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -163,14 +163,14 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
             echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } | tee "$LOG_DIR/wf20-identity.txt"
+          } | tee "$LOG_DIR/wf21-identity.txt"
 
-          grep -Fq 'name: Menchino Android Build WF-20 Valid Package Preflight' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_NUMBER: WF-20' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF20-20260720-R1' "$WORKFLOW_PATH"
-          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf20-workflow-sha256.txt"
+          grep -Fq 'name: Menchino Android Build WF-21 Runtime Shader Retention' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_NUMBER: WF-21' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF21-20260720-R1' "$WORKFLOW_PATH"
+          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf21-workflow-sha256.txt"
           printf '%s\n' "$WORKFLOW_PATH" > "$LOG_DIR/executed-workflow-path.txt"
-          echo 'WF-20 bootstrap identity verification passed.'
+          echo 'WF-21 bootstrap identity verification passed.'
 
       - name: Pull and verify Git LFS objects
         shell: bash
@@ -467,7 +467,32 @@ jobs:
           if 'Unity.ugui' not in references:
               raise SystemExit('Menchino.Runtime.asmdef does not reference Unity.ugui.')
 
-          print('workflow=WF-20')
+          build_configurator = (project / 'Assets' / 'Editor' / 'MenchinoBuildConfigurator.cs').read_text(encoding='utf-8')
+          ui_factory = (project / 'Assets' / 'Scripts' / 'Presentation' / 'UiFactory.cs').read_text(encoding='utf-8')
+          world_factory = (project / 'Assets' / 'Scripts' / 'Presentation' / 'WorldFactory.cs').read_text(encoding='utf-8')
+          app_source = (project / 'Assets' / 'Scripts' / 'Core' / 'MenchinoApp.cs').read_text(encoding='utf-8')
+
+          shader_requirements = {
+              'build_configurator_retains_shaders': (
+                  'm_AlwaysIncludedShaders' in build_configurator and
+                  'RetainRuntimeShaders();' in build_configurator and
+                  '"UI/Default"' in build_configurator and
+                  '"Standard"' in build_configurator
+              ),
+              'ui_images_use_explicit_material': 'image.material = RuntimeUiMaterial' in ui_factory,
+              'ui_text_uses_explicit_material': 'uiText.material = RuntimeTextMaterial' in ui_factory,
+              'runtime_shader_guard_runs_at_boot': 'UiFactory.EnsureRuntimeShaders();' in app_source,
+              'world_uses_standard_first': (
+                  'string[] shaderNames = { "Standard", "Mobile/Diffuse", "Unlit/Color" }' in world_factory
+              ),
+              'world_has_no_urp_shader_lookup': 'Universal Render Pipeline/Lit' not in world_factory,
+          }
+          failed_shader_requirements = [name for name, passed in shader_requirements.items() if not passed]
+          if failed_shader_requirements:
+              raise SystemExit(
+                  'Runtime shader-retention preflight failed: ' + ', '.join(failed_shader_requirements))
+
+          print('workflow=WF-21')
           print('manifest_json=valid')
           print('required_package_count=' + str(len(required)))
           for package_name in sorted(required):
@@ -477,6 +502,9 @@ jobs:
           print('legacy_input_manager=editor_builtin_not_upm_package')
           print('standalone_input_module_provider=com.unity.ugui')
           print('asmdef_unity_ugui_reference=present')
+          for check_name in sorted(shader_requirements):
+              print(f'shader_check={check_name};status=passed')
+          print('runtime_shader_retention=passed')
           print('dependency_preflight=passed')
           PY
 
@@ -541,8 +569,8 @@ jobs:
           runtime_env.chmod(0o600)
 
           (logs / 'activation-validation.txt').write_text(
-              'workflow=WF-20\n'
-              'activation_strategy=valid-package-preflight;clean-home;online-personal-activation;single-container-build\n'
+              'workflow=WF-21\n'
+              'activation_strategy=runtime-shader-preflight;clean-home;online-personal-activation;single-container-build\n'
               'game_ci_builder_used=false\n'
               'github_unity_secrets_used=false\n'
               f'license_bytes={len(license_text.encode("utf-8"))}\n'
@@ -605,7 +633,7 @@ jobs:
           mkdir -p "$CI_ROOT/unity-home/.local/share/unity3d/Unity"
           chmod -R u+rwX,go-rwx "$CI_ROOT/unity-home"
 
-          cat > "$CI_ROOT/run-unity-wf20.sh" <<'BASH'
+          cat > "$CI_ROOT/run-unity-wf21.sh" <<'BASH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -642,7 +670,7 @@ jobs:
             2>/dev/null || true
 
           {
-            echo "workflow=WF-20"
+            echo "workflow=WF-21"
             echo "home=$HOME"
             echo "xdg_cache=$XDG_CACHE_HOME"
             echo "xdg_config=$XDG_CONFIG_HOME"
@@ -655,12 +683,12 @@ jobs:
           run_unity() {
             local label="$1"
             shift
-            echo "[WF-20] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-21] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             set +e
             xvfb-run -a "$UNITY_BIN" "$@"
             local code=$?
             set -e
-            echo "[WF-20] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-21] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             return "$code"
           }
 
@@ -729,7 +757,7 @@ jobs:
           echo "return_license_exit=$RETURN_EXIT" >> "$LOGS/activation-attempts.txt"
           exit 0
           BASH
-          chmod +x "$CI_ROOT/run-unity-wf20.sh"
+          chmod +x "$CI_ROOT/run-unity-wf21.sh"
 
           set +e
           docker run --rm \
@@ -744,7 +772,7 @@ jobs:
             -v "$CI_ROOT/unity-home:/root" \
             -w /menchino-ci \
             "$UNITY_IMAGE" \
-            bash /menchino-ci/run-unity-wf20.sh \
+            bash /menchino-ci/run-unity-wf21.sh \
             2>&1 | tee "$LOG_DIR/direct-unity-container-console.log"
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
@@ -888,7 +916,7 @@ jobs:
               "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" >/dev/null
           done < "$LOG_DIR/old-run-ids.txt"
 
-      - name: Collect sanitized WF-20 failure logs
+      - name: Collect sanitized WF-21 failure logs
         if: ${{ always() && failure() }}
         shell: bash
         env:
@@ -904,7 +932,7 @@ jobs:
           fi
 
           FAILURE_DIR="$CI_ROOT/failure-bundle"
-          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf20-run-${GITHUB_RUN_NUMBER}.zip"
+          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf21-run-${GITHUB_RUN_NUMBER}.zip"
           rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
           mkdir -p "$FAILURE_DIR"
 
@@ -980,11 +1008,11 @@ jobs:
           test -s "$FAILURE_ZIP"
           unzip -t "$FAILURE_ZIP"
 
-      - name: Upload WF-20 error-log ZIP directly
+      - name: Upload WF-21 error-log ZIP directly
         if: ${{ always() && failure() }}
         uses: actions/upload-artifact@v7.0.1
         with:
-          path: /mnt/menchino-ci/menchino-build-error-logs-wf20-run-${{ github.run_number }}.zip
+          path: /mnt/menchino-ci/menchino-build-error-logs-wf21-run-${{ github.run_number }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
