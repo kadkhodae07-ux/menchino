@@ -1,8 +1,8 @@
-# Menchino Workflow Number: WF-16
-# Signature: MENCHINO-WF16-20260719-R1
-# Supersedes: WF-15
-name: Menchino Android Build WF-16 Dynamic Workflow Identity
-run-name: "Menchino WF-16 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
+# Menchino Workflow Number: WF-17
+# Signature: MENCHINO-WF17-20260720-R1
+# Supersedes: WF-16
+name: Menchino Android Build WF-17 High-Capacity Docker Storage
+run-name: "Menchino WF-17 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -12,31 +12,31 @@ on:
       - master
     paths:
       - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf16.yml'
+      - '.github/workflows/menchino-build-wf17.yml'
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: menchino-wf16-${{ github.ref }}
+  group: menchino-wf17-storage-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_NUMBER: WF-16
-  WORKFLOW_SIGNATURE: MENCHINO-WF16-20260719-R1
-  CI_ROOT: .menchino-ci
-  PROJECT_DIR: .menchino-ci/project
-  EXTRACT_DIR: .menchino-ci/extracted
-  LOG_DIR: .menchino-ci/logs
-  PACKAGE_DIR: .menchino-ci/package
-  FINAL_ZIP: .menchino-ci/package/Menchino-Android-Latest.zip
+  WORKFLOW_NUMBER: WF-17
+  WORKFLOW_SIGNATURE: MENCHINO-WF17-20260720-R1
+  CI_ROOT: /mnt/menchino-ci
+  PROJECT_DIR: /mnt/menchino-ci/project
+  EXTRACT_DIR: /mnt/menchino-ci/extracted
+  LOG_DIR: /mnt/menchino-ci/logs
+  PACKAGE_DIR: /mnt/menchino-ci/package
+  FINAL_ZIP: /mnt/menchino-ci/package/Menchino-Android-Latest.zip
   UNITY_IMAGE: unityci/editor:ubuntu-2022.3.62f1-android-3
 
 jobs:
   build-android:
-    name: WF-16 dynamic-identity dual APK build
-    runs-on: ubuntu-latest
+    name: WF-17 high-capacity-storage dual APK build
+    runs-on: ubuntu-22.04
     timeout-minutes: 180
 
     steps:
@@ -48,11 +48,92 @@ jobs:
           clean: true
           persist-credentials: true
 
-      - name: Bootstrap and verify WF-16 identity dynamically
+      - name: Prepare high-capacity storage for Docker and Unity
         shell: bash
         run: |
           set -Eeuo pipefail
-          rm -rf "$CI_ROOT"
+          sudo mkdir -p "$LOG_DIR"
+          sudo chown -R "$(id -u):$(id -g)" "$CI_ROOT"
+          printf '%s\n' 'prepare-high-capacity-storage' > "$LOG_DIR/current-stage.txt"
+          exec > >(tee "$LOG_DIR/storage-preflight.log") 2>&1
+          trap 'code=$?; echo "storage_preflight_exit_code=$code"; echo "storage_preflight_failed_command=$BASH_COMMAND"; exit "$code"' ERR
+
+          echo '=== Disk state before relocation ==='
+          df -hT / /mnt "$GITHUB_WORKSPACE" || true
+          docker info --format 'docker_root_before={{.DockerRootDir}}' || true
+          docker system df || true
+
+          sudo systemctl stop docker.service docker.socket 2>/dev/null || true
+          sudo systemctl stop containerd.service 2>/dev/null || true
+
+          # The GitHub-hosted VM is disposable. Move both Docker stores to /mnt,
+          # which has substantially more free space than the root filesystem.
+          sudo rm -rf /var/lib/docker /var/lib/containerd
+          sudo mkdir -p /var/lib/docker /var/lib/containerd
+          sudo rm -rf /mnt/menchino-docker-data /mnt/menchino-containerd-data
+          sudo mkdir -p /mnt/menchino-docker-data /mnt/menchino-containerd-data
+          sudo chmod 0711 /mnt/menchino-docker-data /mnt/menchino-containerd-data
+          sudo mount --bind /mnt/menchino-docker-data /var/lib/docker
+          sudo mount --bind /mnt/menchino-containerd-data /var/lib/containerd
+
+          sudo python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path('/etc/docker/daemon.json')
+          try:
+              data = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+          except Exception as exc:
+              raise SystemExit(f'Invalid existing Docker daemon.json: {exc}')
+          if not isinstance(data, dict):
+              raise SystemExit('Docker daemon.json root must be an object.')
+          data['data-root'] = '/var/lib/docker'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          PY
+
+          sudo systemctl daemon-reload
+          sudo systemctl start containerd.service
+          sudo systemctl start docker.service
+
+          for attempt in {1..30}; do
+            docker info >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker info >/dev/null
+
+          mountpoint -q /var/lib/docker
+          mountpoint -q /var/lib/containerd
+          test "$(docker info --format '{{.DockerRootDir}}')" = '/var/lib/docker'
+
+          DOCKER_FREE_KB=$(df -Pk /var/lib/docker | awk 'NR==2 {print $4}')
+          MIN_FREE_KB=$((45 * 1024 * 1024))
+          if [ "$DOCKER_FREE_KB" -lt "$MIN_FREE_KB" ]; then
+            echo "Insufficient Docker storage after relocation: ${DOCKER_FREE_KB} KiB available; ${MIN_FREE_KB} KiB required." >&2
+            exit 41
+          fi
+
+          {
+            echo "workflow=$WORKFLOW_NUMBER"
+            echo "docker_root=$(docker info --format '{{.DockerRootDir}}')"
+            echo "docker_backing_source=$(findmnt -n -o SOURCE -T /var/lib/docker)"
+            echo "containerd_backing_source=$(findmnt -n -o SOURCE -T /var/lib/containerd)"
+            echo "docker_free_kb=$DOCKER_FREE_KB"
+            echo "minimum_required_kb=$MIN_FREE_KB"
+          } | tee "$LOG_DIR/storage-layout.txt"
+
+          echo '=== Disk state after relocation ==='
+          df -hT / /mnt /var/lib/docker /var/lib/containerd "$GITHUB_WORKSPACE"
+          docker info --format '{{json .}}' > "$LOG_DIR/docker-info-after-relocation.json"
+          echo 'WF-17 high-capacity storage preparation passed.'
+
+      - name: Bootstrap and verify WF-17 identity dynamically
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo mkdir -p "$CI_ROOT"
+          sudo chown -R "$(id -u):$(id -g)" "$CI_ROOT"
+          find "$CI_ROOT" -mindepth 1 -maxdepth 1 ! -name logs -exec rm -rf {} +
           mkdir -p "$LOG_DIR" "$PACKAGE_DIR" "$EXTRACT_DIR"
           printf '%s\n' 'bootstrap-dynamic-identity' > "$LOG_DIR/current-stage.txt"
           exec > >(tee "$LOG_DIR/bootstrap.log") 2>&1
@@ -82,14 +163,14 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
             echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } | tee "$LOG_DIR/wf16-identity.txt"
+          } | tee "$LOG_DIR/wf17-identity.txt"
 
-          grep -Fq 'name: Menchino Android Build WF-16 Dynamic Workflow Identity' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_NUMBER: WF-16' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF16-20260719-R1' "$WORKFLOW_PATH"
-          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf16-workflow-sha256.txt"
+          grep -Fq 'name: Menchino Android Build WF-17 High-Capacity Docker Storage' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_NUMBER: WF-17' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF17-20260720-R1' "$WORKFLOW_PATH"
+          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf17-workflow-sha256.txt"
           printf '%s\n' "$WORKFLOW_PATH" > "$LOG_DIR/executed-workflow-path.txt"
-          echo 'WF-16 bootstrap identity verification passed.'
+          echo 'WF-17 bootstrap identity verification passed.'
 
       - name: Pull and verify Git LFS objects
         shell: bash
@@ -374,7 +455,7 @@ jobs:
           runtime_env.chmod(0o600)
 
           (logs / 'activation-validation.txt').write_text(
-              'workflow=WF-16\n'
+              'workflow=WF-17\n'
               'activation_strategy=direct-ulf-import;direct-copy;online-fallback\n'
               'game_ci_builder_used=false\n'
               'github_unity_secrets_used=false\n'
@@ -389,13 +470,41 @@ jobs:
           test -s "$CI_ROOT/runtime-unity.env"
           test "$(stat -c '%a' "$CI_ROOT/runtime-unity.env")" = '600'
 
-      - name: Pull pinned Unity Android image
+      - name: Pull pinned Unity Android image on high-capacity storage
         shell: bash
         run: |
           set -Eeuo pipefail
-          printf '%s\n' 'pull-unity-image' > "$LOG_DIR/current-stage.txt"
-          docker pull "$UNITY_IMAGE" 2>&1 | tee "$LOG_DIR/docker-pull.log"
+          printf '%s\n' 'pull-unity-image-high-capacity' > "$LOG_DIR/current-stage.txt"
+          {
+            echo "docker_root=$(docker info --format '{{.DockerRootDir}}')"
+            findmnt -T /var/lib/docker
+            df -hT / /mnt /var/lib/docker /var/lib/containerd
+            docker system df
+          } | tee "$LOG_DIR/docker-storage-before-pull.txt"
+
+          pull_exit=1
+          : > "$LOG_DIR/docker-pull.log"
+          for attempt in 1 2 3; do
+            echo "docker_pull_attempt=$attempt" | tee -a "$LOG_DIR/docker-pull.log"
+            set +e
+            docker pull "$UNITY_IMAGE" 2>&1 | tee -a "$LOG_DIR/docker-pull.log"
+            pull_exit=${PIPESTATUS[0]}
+            set -e
+            [ "$pull_exit" -eq 0 ] && break
+            docker system df | tee -a "$LOG_DIR/docker-pull.log" || true
+            df -hT / /mnt /var/lib/docker /var/lib/containerd | tee -a "$LOG_DIR/docker-pull.log" || true
+            sleep $((attempt * 10))
+          done
+          if [ "$pull_exit" -ne 0 ]; then
+            echo "Unity image pull failed after 3 attempts; exit=$pull_exit" >&2
+            exit "$pull_exit"
+          fi
+
           docker image inspect "$UNITY_IMAGE" > "$LOG_DIR/docker-image-inspect.json"
+          {
+            docker system df
+            df -hT / /mnt /var/lib/docker /var/lib/containerd
+          } | tee "$LOG_DIR/docker-storage-after-pull.txt"
 
       - name: Build exactly two APKs in direct Unity container
         id: unity_build
@@ -406,14 +515,14 @@ jobs:
           rm -rf "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs" "$CI_ROOT/unity-home"
           mkdir -p "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs" "$CI_ROOT/unity-home"
 
-          cat > "$CI_ROOT/run-unity-wf16.sh" <<'BASH'
+          cat > "$CI_ROOT/run-unity-wf17.sh" <<'BASH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
           UNITY_BIN=/opt/unity/Editor/Unity
-          WORKSPACE=/github/workspace
-          PROJECT="$WORKSPACE/.menchino-ci/project"
-          LOGS="$WORKSPACE/.menchino-ci/logs"
+          CI_MOUNT=/menchino-ci
+          PROJECT="$CI_MOUNT/project"
+          LOGS="$CI_MOUNT/logs"
           LICENSE="$PROJECT/.unity-ci/Unity_lic.ulf"
           LICENSE_HOME=/root/.local/share/unity3d/Unity
 
@@ -424,12 +533,12 @@ jobs:
           run_unity() {
             local label="$1"
             shift
-            echo "[WF-16] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-17] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             set +e
             xvfb-run -a "$UNITY_BIN" "$@"
             local code=$?
             set -e
-            echo "[WF-16] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-17] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             return "$code"
           }
 
@@ -501,7 +610,7 @@ jobs:
           echo 'activation_mode=all-direct-paths-failed' >> "$LOGS/activation-attempts.txt"
           exit "$BUILD2_EXIT"
           BASH
-          chmod +x "$CI_ROOT/run-unity-wf16.sh"
+          chmod +x "$CI_ROOT/run-unity-wf17.sh"
 
           set +e
           docker run --rm \
@@ -509,10 +618,10 @@ jobs:
             --shm-size=2g \
             --env-file "$CI_ROOT/runtime-unity.env" \
             -e HOME=/root \
-            -v "$GITHUB_WORKSPACE:/github/workspace" \
-            -w /github/workspace \
+            -v "$CI_ROOT:/menchino-ci" \
+            -w /menchino-ci \
             "$UNITY_IMAGE" \
-            bash /github/workspace/.menchino-ci/run-unity-wf16.sh \
+            bash /menchino-ci/run-unity-wf17.sh \
             2>&1 | tee "$LOG_DIR/direct-unity-container-console.log"
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
@@ -545,7 +654,7 @@ jobs:
           fi
 
           rm -f "$FINAL_ZIP"
-          (cd "$PROJECT_DIR/Builds/Android" && zip -q -0 "$GITHUB_WORKSPACE/$FINAL_ZIP" \
+          (cd "$PROJECT_DIR/Builds/Android" && zip -q -0 "$FINAL_ZIP" \
             Menchino-arm64-v8a.apk Menchino-universal.apk)
 
           python3 - <<'PY'
@@ -570,10 +679,19 @@ jobs:
         id: upload_success
         uses: actions/upload-artifact@v7.0.1
         with:
-          path: .menchino-ci/package/Menchino-Android-Latest.zip
+          path: /mnt/menchino-ci/package/Menchino-Android-Latest.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
+
+      - name: Remove local Unity image after successful packaging
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf '%s\n' 'remove-local-unity-image' > "$LOG_DIR/current-stage.txt"
+          docker image rm -f "$UNITY_IMAGE" 2>&1 | tee "$LOG_DIR/docker-image-cleanup.txt" || true
+          docker system prune -af 2>&1 | tee -a "$LOG_DIR/docker-image-cleanup.txt" || true
 
       - name: Delete previous Menchino artifacts and completed runs
         id: cleanup
@@ -647,7 +765,7 @@ jobs:
               "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" >/dev/null
           done < "$LOG_DIR/old-run-ids.txt"
 
-      - name: Collect sanitized WF-16 failure logs
+      - name: Collect sanitized WF-17 failure logs
         if: ${{ always() && failure() }}
         shell: bash
         env:
@@ -663,7 +781,7 @@ jobs:
           fi
 
           FAILURE_DIR="$CI_ROOT/failure-bundle"
-          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf16-run-${GITHUB_RUN_NUMBER}.zip"
+          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf17-run-${GITHUB_RUN_NUMBER}.zip"
           rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
           mkdir -p "$FAILURE_DIR"
 
@@ -683,7 +801,13 @@ jobs:
 
           docker ps -a > "$FAILURE_DIR/docker-ps.txt" 2>&1 || true
           docker images > "$FAILURE_DIR/docker-images.txt" 2>&1 || true
-          df -h > "$FAILURE_DIR/disk-usage.txt" 2>&1 || true
+          docker system df -v > "$FAILURE_DIR/docker-system-df.txt" 2>&1 || true
+          docker info > "$FAILURE_DIR/docker-info.txt" 2>&1 || true
+          df -hT > "$FAILURE_DIR/disk-usage.txt" 2>&1 || true
+          df -ih > "$FAILURE_DIR/inode-usage.txt" 2>&1 || true
+          findmnt > "$FAILURE_DIR/mount-layout.txt" 2>&1 || true
+          journalctl -u docker.service -u containerd.service --no-pager -n 500 \
+            > "$FAILURE_DIR/docker-service-journal.txt" 2>&1 || true
 
           {
             echo "workflow_number=$WORKFLOW_NUMBER"
@@ -704,14 +828,14 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          root = Path('.menchino-ci/failure-bundle')
+          root = Path('/mnt/menchino-ci/failure-bundle')
           protected = []
-          env_file = Path('.menchino-ci/runtime-unity.env')
+          env_file = Path('/mnt/menchino-ci/runtime-unity.env')
           if env_file.exists():
               for raw in env_file.read_text(encoding='utf-8', errors='replace').splitlines():
                   if '=' in raw:
                       protected.append(raw.split('=', 1)[1])
-          license_path = Path('.menchino-ci/project/.unity-ci/Unity_lic.ulf')
+          license_path = Path('/mnt/menchino-ci/project/.unity-ci/Unity_lic.ulf')
           if license_path.exists():
               protected.append(license_path.read_text(encoding='utf-8', errors='replace').strip())
 
@@ -729,15 +853,16 @@ jobs:
           PY
 
           rm -f "$FAILURE_DIR/runtime-unity.env" 2>/dev/null || true
-          (cd "$FAILURE_DIR" && zip -q -r "$GITHUB_WORKSPACE/$FAILURE_ZIP" .)
+          (cd "$FAILURE_DIR" && zip -q -r "$FAILURE_ZIP" .)
           test -s "$FAILURE_ZIP"
           unzip -t "$FAILURE_ZIP"
 
-      - name: Upload WF-16 error-log ZIP directly
+      - name: Upload WF-17 error-log ZIP directly
         if: ${{ always() && failure() }}
         uses: actions/upload-artifact@v7.0.1
         with:
-          path: .menchino-ci/menchino-build-error-logs-wf16-run-${{ github.run_number }}.zip
+          path: /mnt/menchino-ci/menchino-build-error-logs-wf17-run-${{ github.run_number }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
+ 
