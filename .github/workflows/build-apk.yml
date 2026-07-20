@@ -1,8 +1,8 @@
-# Menchino Workflow Number: WF-15
-# Signature: MENCHINO-WF15-20260718-R1
-# Supersedes: WF-14
-name: Menchino Android Build WF-15 Direct Unity Container
-run-name: "Menchino WF-15 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
+# Menchino Workflow Number: WF-16
+# Signature: MENCHINO-WF16-20260719-R1
+# Supersedes: WF-15
+name: Menchino Android Build WF-16 Dynamic Workflow Identity
+run-name: "Menchino WF-16 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -12,19 +12,19 @@ on:
       - master
     paths:
       - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf15.yml'
+      - '.github/workflows/menchino-build-wf16.yml'
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: menchino-wf15-${{ github.ref }}
+  group: menchino-wf16-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_NUMBER: WF-15
-  WORKFLOW_SIGNATURE: MENCHINO-WF15-20260718-R1
+  WORKFLOW_NUMBER: WF-16
+  WORKFLOW_SIGNATURE: MENCHINO-WF16-20260719-R1
   CI_ROOT: .menchino-ci
   PROJECT_DIR: .menchino-ci/project
   EXTRACT_DIR: .menchino-ci/extracted
@@ -35,7 +35,7 @@ env:
 
 jobs:
   build-android:
-    name: WF-15 direct-container dual APK build
+    name: WF-16 dynamic-identity dual APK build
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -48,29 +48,48 @@ jobs:
           clean: true
           persist-credentials: true
 
-      - name: Bootstrap WF-15
+      - name: Bootstrap and verify WF-16 identity dynamically
         shell: bash
         run: |
           set -Eeuo pipefail
           rm -rf "$CI_ROOT"
           mkdir -p "$LOG_DIR" "$PACKAGE_DIR" "$EXTRACT_DIR"
-          printf '%s\n' 'bootstrap' > "$LOG_DIR/current-stage.txt"
+          printf '%s\n' 'bootstrap-dynamic-identity' > "$LOG_DIR/current-stage.txt"
+          exec > >(tee "$LOG_DIR/bootstrap.log") 2>&1
+          trap 'code=$?; echo "bootstrap_exit_code=$code"; echo "bootstrap_failed_command=$BASH_COMMAND"; exit "$code"' ERR
+
+          WORKFLOW_PATH="${GITHUB_WORKFLOW_REF#${GITHUB_REPOSITORY}/}"
+          WORKFLOW_PATH="${WORKFLOW_PATH%@*}"
+          if [[ "$WORKFLOW_PATH" != .github/workflows/*.yml && "$WORKFLOW_PATH" != .github/workflows/*.yaml ]]; then
+            echo "Invalid workflow path derived from GITHUB_WORKFLOW_REF: $WORKFLOW_PATH" >&2
+            exit 31
+          fi
+          if [ ! -f "$WORKFLOW_PATH" ]; then
+            echo "Executed workflow file is missing from checkout: $WORKFLOW_PATH" >&2
+            find .github/workflows -maxdepth 1 -type f -print | sort || true
+            exit 32
+          fi
+
           {
             echo "workflow_number=$WORKFLOW_NUMBER"
             echo "workflow_signature=$WORKFLOW_SIGNATURE"
-            echo "workflow_file=.github/workflows/menchino-build-wf15.yml"
+            echo "workflow_name=$GITHUB_WORKFLOW"
+            echo "workflow_ref=$GITHUB_WORKFLOW_REF"
+            echo "workflow_file=$WORKFLOW_PATH"
             echo "run_id=$GITHUB_RUN_ID"
             echo "run_number=$GITHUB_RUN_NUMBER"
             echo "repository=$GITHUB_REPOSITORY"
             echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
             echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } | tee "$LOG_DIR/wf15-identity.txt"
+          } | tee "$LOG_DIR/wf16-identity.txt"
 
-          test -f .github/workflows/menchino-build-wf15.yml
-          grep -Fq 'name: Menchino Android Build WF-15 Direct Unity Container' .github/workflows/menchino-build-wf15.yml
-          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF15-20260718-R1' .github/workflows/menchino-build-wf15.yml
-          sha256sum .github/workflows/menchino-build-wf15.yml | tee "$LOG_DIR/wf15-workflow-sha256.txt"
+          grep -Fq 'name: Menchino Android Build WF-16 Dynamic Workflow Identity' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_NUMBER: WF-16' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF16-20260719-R1' "$WORKFLOW_PATH"
+          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf16-workflow-sha256.txt"
+          printf '%s\n' "$WORKFLOW_PATH" > "$LOG_DIR/executed-workflow-path.txt"
+          echo 'WF-16 bootstrap identity verification passed.'
 
       - name: Pull and verify Git LFS objects
         shell: bash
@@ -355,7 +374,7 @@ jobs:
           runtime_env.chmod(0o600)
 
           (logs / 'activation-validation.txt').write_text(
-              'workflow=WF-15\n'
+              'workflow=WF-16\n'
               'activation_strategy=direct-ulf-import;direct-copy;online-fallback\n'
               'game_ci_builder_used=false\n'
               'github_unity_secrets_used=false\n'
@@ -387,7 +406,7 @@ jobs:
           rm -rf "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs" "$CI_ROOT/unity-home"
           mkdir -p "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs" "$CI_ROOT/unity-home"
 
-          cat > "$CI_ROOT/run-unity-wf15.sh" <<'BASH'
+          cat > "$CI_ROOT/run-unity-wf16.sh" <<'BASH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -405,12 +424,12 @@ jobs:
           run_unity() {
             local label="$1"
             shift
-            echo "[WF-15] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-16] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             set +e
             xvfb-run -a "$UNITY_BIN" "$@"
             local code=$?
             set -e
-            echo "[WF-15] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-16] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             return "$code"
           }
 
@@ -482,7 +501,7 @@ jobs:
           echo 'activation_mode=all-direct-paths-failed' >> "$LOGS/activation-attempts.txt"
           exit "$BUILD2_EXIT"
           BASH
-          chmod +x "$CI_ROOT/run-unity-wf15.sh"
+          chmod +x "$CI_ROOT/run-unity-wf16.sh"
 
           set +e
           docker run --rm \
@@ -493,7 +512,7 @@ jobs:
             -v "$GITHUB_WORKSPACE:/github/workspace" \
             -w /github/workspace \
             "$UNITY_IMAGE" \
-            bash /github/workspace/.menchino-ci/run-unity-wf15.sh \
+            bash /github/workspace/.menchino-ci/run-unity-wf16.sh \
             2>&1 | tee "$LOG_DIR/direct-unity-container-console.log"
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
@@ -628,7 +647,7 @@ jobs:
               "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" >/dev/null
           done < "$LOG_DIR/old-run-ids.txt"
 
-      - name: Collect sanitized WF-15 failure logs
+      - name: Collect sanitized WF-16 failure logs
         if: ${{ always() && failure() }}
         shell: bash
         env:
@@ -644,7 +663,7 @@ jobs:
           fi
 
           FAILURE_DIR="$CI_ROOT/failure-bundle"
-          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf15-run-${GITHUB_RUN_NUMBER}.zip"
+          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf16-run-${GITHUB_RUN_NUMBER}.zip"
           rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
           mkdir -p "$FAILURE_DIR"
 
@@ -714,11 +733,11 @@ jobs:
           test -s "$FAILURE_ZIP"
           unzip -t "$FAILURE_ZIP"
 
-      - name: Upload WF-15 error-log ZIP directly
+      - name: Upload WF-16 error-log ZIP directly
         if: ${{ always() && failure() }}
         uses: actions/upload-artifact@v7.0.1
         with:
-          path: .menchino-ci/menchino-build-error-logs-wf15-run-${{ github.run_number }}.zip
+          path: .menchino-ci/menchino-build-error-logs-wf16-run-${{ github.run_number }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
