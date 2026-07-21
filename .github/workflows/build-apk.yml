@@ -1,8 +1,8 @@
-# Menchino Workflow Number: WF-22
-# Signature: MENCHINO-WF22-20260720-R1
-# Supersedes: WF-21
-name: Menchino Android Build WF-22 Persistent Runtime Shader Assets
-run-name: "Menchino WF-22 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
+# Menchino Workflow Number: WF-23
+# Signature: MENCHINO-WF23-20260721-R1
+# Supersedes: WF-22
+name: Menchino Android Build WF-23 Builtin Shader Pruning
+run-name: "Menchino WF-23 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -12,19 +12,19 @@ on:
       - master
     paths:
       - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf22.yml'
+      - '.github/workflows/menchino-build-wf23.yml'
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: menchino-wf22-persistent-runtime-shader-assets-${{ github.ref }}
+  group: menchino-wf23-builtin-shader-pruning-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_NUMBER: WF-22
-  WORKFLOW_SIGNATURE: MENCHINO-WF22-20260720-R1
+  WORKFLOW_NUMBER: WF-23
+  WORKFLOW_SIGNATURE: MENCHINO-WF23-20260721-R1
   CI_ROOT: /mnt/menchino-ci
   PROJECT_DIR: /mnt/menchino-ci/project
   EXTRACT_DIR: /mnt/menchino-ci/extracted
@@ -35,7 +35,7 @@ env:
 
 jobs:
   build-android:
-    name: WF-22 persistent-shader-assets dual APK build
+    name: WF-23 builtin-shader-pruning dual APK build
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
@@ -125,9 +125,9 @@ jobs:
           echo '=== Disk state after relocation ==='
           df -hT / /mnt /var/lib/docker /var/lib/containerd "$GITHUB_WORKSPACE"
           docker info --format '{{json .}}' > "$LOG_DIR/docker-info-after-relocation.json"
-          echo 'WF-22 high-capacity storage preparation passed.'
+          echo 'WF-23 high-capacity storage preparation passed.'
 
-      - name: Bootstrap and verify WF-22 identity dynamically
+      - name: Bootstrap and verify WF-23 identity dynamically
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -163,14 +163,14 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "commit=$GITHUB_SHA"
             echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } | tee "$LOG_DIR/wf22-identity.txt"
+          } | tee "$LOG_DIR/wf23-identity.txt"
 
-          grep -Fq 'name: Menchino Android Build WF-22 Persistent Runtime Shader Assets' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_NUMBER: WF-22' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF22-20260720-R1' "$WORKFLOW_PATH"
-          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf22-workflow-sha256.txt"
+          grep -Fq 'name: Menchino Android Build WF-23 Builtin Shader Pruning' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_NUMBER: WF-23' "$WORKFLOW_PATH"
+          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF23-20260721-R1' "$WORKFLOW_PATH"
+          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf23-workflow-sha256.txt"
           printf '%s\n' "$WORKFLOW_PATH" > "$LOG_DIR/executed-workflow-path.txt"
-          echo 'WF-22 bootstrap identity verification passed.'
+          echo 'WF-23 bootstrap identity verification passed.'
 
       - name: Pull and verify Git LFS objects
         shell: bash
@@ -472,14 +472,47 @@ jobs:
           world_factory = (project / 'Assets' / 'Scripts' / 'Presentation' / 'WorldFactory.cs').read_text(encoding='utf-8')
           app_source = (project / 'Assets' / 'Scripts' / 'Core' / 'MenchinoApp.cs').read_text(encoding='utf-8')
 
+          ui_shader_source = (project / 'Assets' / 'Shaders' / 'MenchinoRuntimeUI.shader').read_text(encoding='utf-8')
+          world_shader_source = (project / 'Assets' / 'Shaders' / 'MenchinoRuntimeWorld.shader').read_text(encoding='utf-8')
+
+          retain_method_match = re.search(
+              r'private static void RetainRuntimeShaders\(\)\s*\{(?P<body>.*?)\n        \}\n\n        private static void EnsureRuntimeMaterialAssets',
+              build_configurator,
+              re.DOTALL,
+          )
+          if retain_method_match is None:
+              raise SystemExit('Could not isolate RetainRuntimeShaders() for validation.')
+          retain_method_body = retain_method_match.group('body')
+
           shader_requirements = {
               'custom_ui_shader_asset_present': (
-                  (project / 'Assets' / 'Shaders' / 'MenchinoRuntimeUI.shader').is_file() and
-                  'Shader "Menchino/RuntimeUI"' in (project / 'Assets' / 'Shaders' / 'MenchinoRuntimeUI.shader').read_text(encoding='utf-8')
+                  'Shader "Menchino/RuntimeUI"' in ui_shader_source
               ),
               'custom_world_shader_asset_present': (
-                  (project / 'Assets' / 'Shaders' / 'MenchinoRuntimeWorld.shader').is_file() and
-                  'Shader "Menchino/RuntimeWorld"' in (project / 'Assets' / 'Shaders' / 'MenchinoRuntimeWorld.shader').read_text(encoding='utf-8')
+                  'Shader "Menchino/RuntimeWorld"' in world_shader_source
+              ),
+              'ui_shader_is_self_contained': (
+                  'Fallback Off' in ui_shader_source and
+                  'Fallback "UI/Default"' not in ui_shader_source
+              ),
+              'world_shader_is_compact_vertex_fragment': (
+                  'Fallback Off' in world_shader_source and
+                  '#pragma surface' not in world_shader_source and
+                  'Fallback "Standard"' not in world_shader_source
+              ),
+              'build_configurator_prunes_builtin_always_included_shaders': (
+                  'includedShaders.ClearArray();' in retain_method_body and
+                  'AssetDatabase.LoadAssetAtPath<Shader>' in retain_method_body and
+                  'optionalShaderNames' not in retain_method_body and
+                  'Shader.Find(' not in retain_method_body
+              ),
+              'runtime_factories_do_not_use_builtin_shader_fallbacks': (
+                  '"GUI/Text Shader"' not in ui_factory and
+                  '"UI/Default"' not in ui_factory and
+                  '"Sprites/Default"' not in ui_factory and
+                  '"Standard"' not in world_factory and
+                  '"Mobile/Diffuse"' not in world_factory and
+                  '"Unlit/Color"' not in world_factory
               ),
               'build_configurator_creates_persistent_materials': (
                   'EnsureRuntimeMaterialAssets();' in build_configurator and
@@ -506,7 +539,7 @@ jobs:
               raise SystemExit(
                   'Runtime shader-retention preflight failed: ' + ', '.join(failed_shader_requirements))
 
-          print('workflow=WF-22')
+          print('workflow=WF-23')
           print('manifest_json=valid')
           print('required_package_count=' + str(len(required)))
           for package_name in sorted(required):
@@ -583,8 +616,8 @@ jobs:
           runtime_env.chmod(0o600)
 
           (logs / 'activation-validation.txt').write_text(
-              'workflow=WF-22\n'
-              'activation_strategy=persistent-shader-assets-preflight;clean-home;online-personal-activation;single-container-build\n'
+              'workflow=WF-23\n'
+              'activation_strategy=builtin-shader-pruning-preflight;clean-home;online-personal-activation;single-container-build\n'
               'game_ci_builder_used=false\n'
               'github_unity_secrets_used=false\n'
               f'license_bytes={len(license_text.encode("utf-8"))}\n'
@@ -647,7 +680,7 @@ jobs:
           mkdir -p "$CI_ROOT/unity-home/.local/share/unity3d/Unity"
           chmod -R u+rwX,go-rwx "$CI_ROOT/unity-home"
 
-          cat > "$CI_ROOT/run-unity-wf22.sh" <<'BASH'
+          cat > "$CI_ROOT/run-unity-wf23.sh" <<'BASH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -684,7 +717,7 @@ jobs:
             2>/dev/null || true
 
           {
-            echo "workflow=WF-22"
+            echo "workflow=WF-23"
             echo "home=$HOME"
             echo "xdg_cache=$XDG_CACHE_HOME"
             echo "xdg_config=$XDG_CONFIG_HOME"
@@ -697,12 +730,12 @@ jobs:
           run_unity() {
             local label="$1"
             shift
-            echo "[WF-22] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-23] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             set +e
             xvfb-run -a "$UNITY_BIN" "$@"
             local code=$?
             set -e
-            echo "[WF-22] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "[WF-23] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             return "$code"
           }
 
@@ -771,7 +804,7 @@ jobs:
           echo "return_license_exit=$RETURN_EXIT" >> "$LOGS/activation-attempts.txt"
           exit 0
           BASH
-          chmod +x "$CI_ROOT/run-unity-wf22.sh"
+          chmod +x "$CI_ROOT/run-unity-wf23.sh"
 
           set +e
           docker run --rm \
@@ -786,7 +819,7 @@ jobs:
             -v "$CI_ROOT/unity-home:/root" \
             -w /menchino-ci \
             "$UNITY_IMAGE" \
-            bash /menchino-ci/run-unity-wf22.sh \
+            bash /menchino-ci/run-unity-wf23.sh \
             2>&1 | tee "$LOG_DIR/direct-unity-container-console.log"
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
@@ -930,7 +963,7 @@ jobs:
               "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" >/dev/null
           done < "$LOG_DIR/old-run-ids.txt"
 
-      - name: Collect sanitized WF-22 failure logs
+      - name: Collect sanitized WF-23 failure logs
         if: ${{ always() && failure() }}
         shell: bash
         env:
@@ -946,7 +979,7 @@ jobs:
           fi
 
           FAILURE_DIR="$CI_ROOT/failure-bundle"
-          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf22-run-${GITHUB_RUN_NUMBER}.zip"
+          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf23-run-${GITHUB_RUN_NUMBER}.zip"
           rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
           mkdir -p "$FAILURE_DIR"
 
@@ -1022,11 +1055,11 @@ jobs:
           test -s "$FAILURE_ZIP"
           unzip -t "$FAILURE_ZIP"
 
-      - name: Upload WF-22 error-log ZIP directly
+      - name: Upload WF-23 error-log ZIP directly
         if: ${{ always() && failure() }}
         uses: actions/upload-artifact@v7.0.1
         with:
-          path: /mnt/menchino-ci/menchino-build-error-logs-wf22-run-${{ github.run_number }}.zip
+          path: /mnt/menchino-ci/menchino-build-error-logs-wf23-run-${{ github.run_number }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 7
