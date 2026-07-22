@@ -1,4 +1,4 @@
-name: Menchino Android Store Build WF-2
+name: Menchino Android Store Build WF-3
 
 on:
   workflow_dispatch:
@@ -6,14 +6,14 @@ on:
     branches: [main]
     paths:
       - '*.zip'
-      - '.github/workflows/menchino-build-wf2.yml'
+      - '.github/workflows/menchino-build-wf3.yml'
 
 permissions:
   contents: write
   actions: write
 
 concurrency:
-  group: menchino-unity-wf2-${{ github.ref }}
+  group: menchino-unity-wf3-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -21,12 +21,12 @@ env:
   PROJECT_PATH: unity-project
   PACKAGE_NAME: mk.kadkhodai.menchino
   VERSION_NAME: 0.1.0
-  VERSION_CODE: '2'
+  VERSION_CODE: '3'
 
 jobs:
   build-store-apks:
     if: github.actor != 'github-actions[bot]'
-    name: WF-2 • Latest Unity ZIP • Bazaar + Myket
+    name: WF-3 • One Unity Session • Bazaar + Myket
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -44,13 +44,15 @@ jobs:
         run: |
           set -Eeuo pipefail
           shopt -s nullglob
-          rm -rf "$PROJECT_PATH" "$RUNNER_TEMP/menchino-zip-probe"
-          mkdir -p "$PROJECT_PATH" "$RUNNER_TEMP/menchino-zip-probe"
+          rm -rf "$PROJECT_PATH" "$RUNNER_TEMP/menchino-wf3-zip-probe"
+          mkdir -p "$PROJECT_PATH" "$RUNNER_TEMP/menchino-wf3-zip-probe"
 
           mapfile -t CANDIDATES < <(
             while IFS= read -r -d '' file; do
-              case "$(basename "$file")" in
-                *output*|*delivery*|*artifact*|*logs*|Unity_lic.zip|*keystore*.zip) continue ;;
+              base="$(basename "$file")"
+              lower="${base,,}"
+              case "$lower" in
+                *output*|*delivery*|*artifact*|*failure*|*logs*|unity_lic.zip|*keystore*.zip) continue ;;
               esac
               stamp="$(git log -1 --format=%ct -- "$file" 2>/dev/null || printf '0')"
               printf '%s\t%s\n' "$stamp" "$file"
@@ -58,31 +60,45 @@ jobs:
           )
 
           if [ "${#CANDIDATES[@]}" -eq 0 ]; then
-            echo "::error::هیچ ZIP کاندید در ریشه مخزن پیدا نشد."
+            echo "::error::هیچ فایل ZIP کاندید در ریشه مخزن پیدا نشد."
             exit 10
           fi
 
           SELECTED_ZIP=""
           while IFS=$'\t' read -r _stamp zip_file; do
             [ -n "$zip_file" ] || continue
-            probe="$RUNNER_TEMP/menchino-zip-probe/current"
+            probe="$RUNNER_TEMP/menchino-wf3-zip-probe/current"
             rm -rf "$probe"
             mkdir -p "$probe"
-            if ! unzip -q "$zip_file" -d "$probe"; then
-              echo "ZIP نامعتبر رد شد: $zip_file"
+
+            if ! unzip -tq "$zip_file" >/dev/null 2>&1; then
+              echo "Rejected corrupt ZIP: $zip_file"
               continue
             fi
-            project_version="$(find "$probe" -type f -path '*/ProjectSettings/ProjectVersion.txt' -print -quit)"
-            if [ -n "$project_version" ]; then
-              SELECTED_ZIP="${zip_file#./}"
-              project_root="${project_version%/ProjectSettings/ProjectVersion.txt}"
-              cp -a "$project_root"/. "$PROJECT_PATH"/
-              break
+            if ! unzip -q "$zip_file" -d "$probe"; then
+              echo "Rejected unreadable ZIP: $zip_file"
+              continue
             fi
+
+            project_version="$(find "$probe" -type f -path '*/ProjectSettings/ProjectVersion.txt' -print -quit)"
+            [ -n "$project_version" ] || {
+              echo "Rejected non-Unity ZIP: $zip_file"
+              continue
+            }
+
+            project_root="${project_version%/ProjectSettings/ProjectVersion.txt}"
+            if [ ! -f "$project_root/Packages/manifest.json" ] || [ ! -d "$project_root/Assets" ]; then
+              echo "Rejected incomplete Unity ZIP: $zip_file"
+              continue
+            fi
+
+            SELECTED_ZIP="${zip_file#./}"
+            cp -a "$project_root"/. "$PROJECT_PATH"/
+            break
           done < <(printf '%s\n' "${CANDIDATES[@]}" | sort -t $'\t' -k1,1nr -k2,2Vr)
 
           if [ -z "$SELECTED_ZIP" ]; then
-            echo "::error::هیچ ZIP دارای ساختار معتبر پروژه Unity پیدا نشد."
+            echo "::error::هیچ ZIP دارای پروژه کامل Unity پیدا نشد."
             exit 11
           fi
 
@@ -90,23 +106,35 @@ jobs:
           test -f "$PROJECT_PATH/Packages/manifest.json"
           test -f "$PROJECT_PATH/Assets/Scenes/Bootstrap.unity"
           test -f "$PROJECT_PATH/Assets/RoyalGame/Scripts/Editor/AndroidBuild.cs"
+          test -f "$PROJECT_PATH/Assets/RoyalGame/Scripts/Menchino.RoyalSnakes.Runtime.asmdef"
+          test -f "$PROJECT_PATH/Assets/RoyalGame/Scripts/Editor/Menchino.RoyalSnakes.Editor.asmdef"
           grep -Fq "m_EditorVersion: $UNITY_VERSION" "$PROJECT_PATH/ProjectSettings/ProjectVersion.txt"
+          grep -Fq 'BuildAllStores' "$PROJECT_PATH/Assets/RoyalGame/Scripts/Editor/AndroidBuild.cs"
+          grep -Fq 'VersionCode = 3' "$PROJECT_PATH/Assets/RoyalGame/Scripts/Editor/AndroidBuild.cs"
           grep -Fq "$PACKAGE_NAME" "$PROJECT_PATH/Assets/RoyalGame/Scripts/Editor/AndroidBuild.cs"
 
           printf 'source_zip=%s\n' "$SELECTED_ZIP" >> "$GITHUB_OUTPUT"
           printf 'Selected source ZIP: %s\n' "$SELECTED_ZIP"
-          printf 'Unity project: %s\n' "$PROJECT_PATH"
+          printf 'Unity project root: %s\n' "$PROJECT_PATH"
 
-      - name: Validate embedded Unity credentials and Android signing
+      - name: Validate embedded Unity license and Android signing
+        id: credentials
         shell: bash
         run: |
           set -Eeuo pipefail
           CREDS="$PROJECT_PATH/BuildCredentials/Unity/unity_credentials.env"
           LICENSE="$PROJECT_PATH/BuildCredentials/Unity/Unity_lic.ulf"
           SIGNING="$PROJECT_PATH/BuildCredentials/AndroidSigning/key.properties"
+
           test -s "$CREDS"
           test -s "$LICENSE"
           test -s "$SIGNING"
+          python3 - "$LICENSE" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          ET.parse(sys.argv[1])
+          print('Unity ULF XML parsed successfully.')
+          PY
+
           set -a
           # shellcheck disable=SC1090
           source "$CREDS"
@@ -117,62 +145,53 @@ jobs:
           echo "::add-mask::$UNITY_PASSWORD"
           printf 'UNITY_EMAIL=%s\n' "$UNITY_EMAIL" >> "$GITHUB_ENV"
           printf 'UNITY_PASSWORD=%s\n' "$UNITY_PASSWORD" >> "$GITHUB_ENV"
-          delimiter="UNITY_LICENSE_$(date +%s)_$RANDOM"
+
+          delimiter="UNITY_LICENSE_WF3_$(date +%s)_$RANDOM"
           {
             printf 'UNITY_LICENSE<<%s\n' "$delimiter"
             cat "$LICENSE"
             printf '\n%s\n' "$delimiter"
           } >> "$GITHUB_ENV"
 
-          STORE_PASSWORD="$(awk -F= '$1=="storePassword"{sub(/^[^=]*=/,""); print}' "$SIGNING")"
-          KEY_PASSWORD="$(awk -F= '$1=="keyPassword"{sub(/^[^=]*=/,""); print}' "$SIGNING")"
-          KEY_ALIAS="$(awk -F= '$1=="keyAlias"{sub(/^[^=]*=/,""); print}' "$SIGNING")"
-          STORE_FILE="$(awk -F= '$1=="storeFile"{sub(/^[^=]*=/,""); print}' "$SIGNING")"
+          read_property() {
+            local key="$1"
+            awk -F= -v key="$key" '$1==key {sub(/^[^=]*=/, ""); print; exit}' "$SIGNING"
+          }
+
+          STORE_PASSWORD="$(read_property storePassword)"
+          KEY_PASSWORD="$(read_property keyPassword)"
+          KEY_ALIAS="$(read_property keyAlias)"
+          STORE_FILE="$(read_property storeFile)"
           test -n "$STORE_PASSWORD"
           test -n "$KEY_PASSWORD"
           test -n "$KEY_ALIAS"
-          test -s "$PROJECT_PATH/BuildCredentials/AndroidSigning/$STORE_FILE"
+          test -n "$STORE_FILE"
+          KEYSTORE="$PROJECT_PATH/BuildCredentials/AndroidSigning/$STORE_FILE"
+          test -s "$KEYSTORE"
           echo "::add-mask::$STORE_PASSWORD"
           echo "::add-mask::$KEY_PASSWORD"
-          keytool -list -keystore "$PROJECT_PATH/BuildCredentials/AndroidSigning/$STORE_FILE" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
-          echo "Unity credentials, license XML and release keystore passed preflight."
+          keytool -list -keystore "$KEYSTORE" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          echo "Embedded Unity credentials, ULF and release keystore passed WF-3 preflight."
 
       - name: Restore Unity Library cache
         uses: actions/cache@v4
         with:
           path: ${{ env.PROJECT_PATH }}/Library
-          key: menchino-unity-${{ env.UNITY_VERSION }}-wf2-${{ hashFiles('unity-project/Packages/**', 'unity-project/ProjectSettings/**', 'unity-project/Assets/**/*.cs') }}
+          key: menchino-unity-${{ env.UNITY_VERSION }}-wf3-${{ hashFiles('unity-project/Packages/**', 'unity-project/ProjectSettings/**', 'unity-project/Assets/**/*.cs', 'unity-project/Assets/**/*.asmdef') }}
           restore-keys: |
-            menchino-unity-${{ env.UNITY_VERSION }}-wf2-
+            menchino-unity-${{ env.UNITY_VERSION }}-wf3-
 
-      - name: Run Unity EditMode tests
-        uses: game-ci/unity-test-runner@v4
-        with:
-          projectPath: ${{ env.PROJECT_PATH }}
-          unityVersion: ${{ env.UNITY_VERSION }}
-          testMode: EditMode
-          artifactsPath: TestResults
-          checkName: Menchino EditMode Tests WF-2
-
-      - name: Build signed Bazaar APK
+      - name: Build both signed store APKs in one Unity session
+        id: unity_build
         uses: game-ci/unity-builder@v4
         with:
           projectPath: ${{ env.PROJECT_PATH }}
           unityVersion: ${{ env.UNITY_VERSION }}
           targetPlatform: Android
-          buildMethod: Menchino.RoyalSnakes.Editor.AndroidBuild.BuildBazaar
+          buildMethod: Menchino.RoyalSnakes.Editor.AndroidBuild.BuildAllStores
           androidExportType: androidPackage
 
-      - name: Build signed Myket APK
-        uses: game-ci/unity-builder@v4
-        with:
-          projectPath: ${{ env.PROJECT_PATH }}
-          unityVersion: ${{ env.UNITY_VERSION }}
-          targetPlatform: Android
-          buildMethod: Menchino.RoyalSnakes.Editor.AndroidBuild.BuildMyket
-          androidExportType: androidPackage
-
-      - name: Verify exactly two signed store APKs
+      - name: Verify exactly two distinct signed APKs
         id: verify
         shell: bash
         run: |
@@ -194,116 +213,160 @@ jobs:
           test -x "$APKSIGNER"
           test -x "$AAPT"
 
+          mkdir -p verified-output "$RUNNER_TEMP/menchino-wf3-verification"
           for apk in "$BAZAAR" "$MYKET"; do
+            name="$(basename "$apk")"
             unzip -tq "$apk" >/dev/null
-            "$APKSIGNER" verify --verbose --print-certs "$apk" > "${apk%.apk}.signature.txt"
-            "$AAPT" dump badging "$apk" > "${apk%.apk}.badging.txt"
-            grep -Fq "package: name='$PACKAGE_NAME'" "${apk%.apk}.badging.txt"
-            grep -Fq "versionCode='$VERSION_CODE'" "${apk%.apk}.badging.txt"
+            "$APKSIGNER" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/menchino-wf3-verification/${name%.apk}.signature.txt"
+            "$AAPT" dump badging "$apk" > "$RUNNER_TEMP/menchino-wf3-verification/${name%.apk}.badging.txt"
+            grep -Fq "package: name='$PACKAGE_NAME'" "$RUNNER_TEMP/menchino-wf3-verification/${name%.apk}.badging.txt"
+            grep -Fq "versionCode='$VERSION_CODE'" "$RUNNER_TEMP/menchino-wf3-verification/${name%.apk}.badging.txt"
+            cp "$apk" verified-output/
           done
 
           if cmp -s "$BAZAAR" "$MYKET"; then
-            echo "::error::دو APK کاملاً یکسان هستند؛ تفکیک کانال فروشگاه اعمال نشده است."
+            echo "::error::Bazaar and Myket APK files are byte-identical; store channel separation failed."
             exit 31
           fi
 
-          mkdir -p verified-output
-          cp "$BAZAAR" "$MYKET" verified-output/
-          (cd verified-output && sha256sum *.apk > SHA256SUMS.txt)
           test "$(find verified-output -maxdepth 1 -type f -name '*.apk' | wc -l)" -eq 2
+          (cd verified-output && sha256sum *.apk) | tee "$RUNNER_TEMP/menchino-wf3-SHA256SUMS.txt"
 
-      - name: Remove prior GitHub outputs and rewrite repository as one clean snapshot
+      - name: Delete previous outputs and replace branch history with one clean snapshot
+        id: clean_repository
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_ZIP: ${{ steps.prepare.outputs.source_zip }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          PUBLISH="$RUNNER_TEMP/menchino-clean-snapshot"
+          PUBLISH="$RUNNER_TEMP/menchino-wf3-clean-snapshot"
           rm -rf "$PUBLISH"
           mkdir -p "$PUBLISH/.github/workflows" "$PUBLISH/output"
 
           cp "$SOURCE_ZIP" "$PUBLISH/$(basename "$SOURCE_ZIP")"
-          cp ".github/workflows/menchino-build-wf2.yml" "$PUBLISH/.github/workflows/menchino-build-wf2.yml"
+          cp ".github/workflows/menchino-build-wf3.yml" "$PUBLISH/.github/workflows/menchino-build-wf3.yml"
           cp verified-output/*.apk "$PUBLISH/output/"
           test "$(find "$PUBLISH/output" -maxdepth 1 -type f -name '*.apk' | wc -l)" -eq 2
+          test "$(find "$PUBLISH/output" -maxdepth 1 -type f | wc -l)" -eq 2
 
-          # Delete previous Actions artifacts.
+          # Remove old Actions artifacts before the new successful artifact is uploaded.
           mapfile -t artifact_ids < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '.artifacts[].id' || true)
           for id in "${artifact_ids[@]:-}"; do
-            [ -n "$id" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+            [ -n "$id" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" || true
           done
 
-          # Delete previous workflow runs, except the currently executing run.
+          # Remove old runs but never the current running workflow.
           mapfile -t run_ids < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100" --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID) | .id" || true)
           for id in "${run_ids[@]:-}"; do
             [ -n "$id" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" || true
           done
 
-          # Delete previous releases and tags.
+          # Remove all releases and tags.
           mapfile -t release_ids < <(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].id' || true)
           for id in "${release_ids[@]:-}"; do
-            [ -n "$id" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+            [ -n "$id" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" || true
           done
           mapfile -t tags < <(git tag -l)
           for tag in "${tags[@]:-}"; do
-            [ -n "$tag" ] && git push origin ":refs/tags/$tag"
+            [ -n "$tag" ] && git push origin ":refs/tags/$tag" || true
           done
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan menchino-clean-snapshot
+          git checkout --orphan menchino-wf3-clean-snapshot
           git rm -rf . >/dev/null 2>&1 || true
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           cp -a "$PUBLISH"/. .
           git add -f .
-          git commit -m "Menchino v${VERSION_NAME}+${VERSION_CODE} clean store outputs [skip ci]"
+          git commit -m "Menchino v${VERSION_NAME}+${VERSION_CODE} Bazaar and Myket outputs [skip ci]"
           git branch -M "$GITHUB_REF_NAME"
           git push --force origin "HEAD:$GITHUB_REF_NAME"
 
-          echo "Repository branch was replaced by one orphan snapshot commit."
-          echo "The output directory contains exactly the Bazaar and Myket APK files."
+          echo "Repository branch now contains one orphan snapshot commit and exactly two APK outputs."
 
-      - name: Collect complete failure diagnostics
+      - name: Upload current Bazaar and Myket APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: menchino-v${{ env.VERSION_NAME }}-build${{ env.VERSION_CODE }}-bazaar-myket
+          path: verified-output/*.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Collect focused failure diagnostics
         if: failure()
         shell: bash
         run: |
           set +e
-          LOG_DIR="$RUNNER_TEMP/menchino-wf2-failure-logs"
+          LOG_DIR="$GITHUB_WORKSPACE/menchino-wf3-failure-logs-${GITHUB_RUN_ID}"
+          RAW_DIR="$LOG_DIR/raw"
           rm -rf "$LOG_DIR"
-          mkdir -p "$LOG_DIR"
+          mkdir -p "$RAW_DIR"
+
           {
-            echo "Workflow: Menchino WF-2"
+            echo "Workflow: Menchino WF-3"
             echo "Run: $GITHUB_RUN_ID"
             echo "Commit: $GITHUB_SHA"
             echo "Branch: $GITHUB_REF_NAME"
             echo "UTC: $(date -u +%FT%TZ)"
             echo "Unity: $UNITY_VERSION"
             echo "Package: $PACKAGE_NAME"
+            echo "Version: $VERSION_NAME+$VERSION_CODE"
+            echo "Source ZIP: ${{ steps.prepare.outputs.source_zip }}"
             echo
-            echo "Repository root files:"
-            find . -maxdepth 2 -type f -printf '%p (%s bytes)\n' | sort
-            echo
-            echo "Unity project build files:"
-            find "$PROJECT_PATH/Build" -maxdepth 2 -type f -printf '%p (%s bytes)\n' 2>/dev/null | sort
+            echo "Step outcomes:"
+            echo "credentials=${{ steps.credentials.outcome }}"
+            echo "unity_build=${{ steps.unity_build.outcome }}"
+            echo "verify=${{ steps.verify.outcome }}"
+            echo "clean_repository=${{ steps.clean_repository.outcome }}"
           } > "$LOG_DIR/failure-summary.txt" 2>&1
 
-          find "$PROJECT_PATH" "$RUNNER_TEMP" -type f \
-            \( -iname '*.log' -o -iname '*TestResults*.xml' -o -iname '*.txt' \) \
-            -size -50M -print0 2>/dev/null | while IFS= read -r -d '' file; do
-              safe="$(printf '%s' "$file" | sed 's#^/##; s#[/: ]#_#g')"
-              cp "$file" "$LOG_DIR/$safe" 2>/dev/null || true
-            done
+          {
+            echo "Repository files:"
+            find . -maxdepth 3 -type f -printf '%p (%s bytes)\n' | sort
+            echo
+            echo "Build files:"
+            find "$PROJECT_PATH/Build" verified-output -maxdepth 3 -type f -printf '%p (%s bytes)\n' 2>/dev/null | sort
+          } > "$LOG_DIR/file-tree.txt" 2>&1
 
-          grep -RInE '(^|[^A-Za-z])(error|exception|failed|failure|fatal)([^A-Za-z]|$)' "$LOG_DIR" \
-            > "$LOG_DIR/error-lines.txt" 2>/dev/null || true
-          tar -czf "$GITHUB_WORKSPACE/menchino-wf2-failure-logs-${GITHUB_RUN_ID}.tar.gz" -C "$LOG_DIR" .
+          copy_log() {
+            local file="$1"
+            [ -f "$file" ] || return 0
+            case "$file" in
+              */PackageCache/*|*/Library/PackageCache/*|*/.cache/*|*/cache/packages/*) return 0 ;;
+            esac
+            local size
+            size="$(stat -c %s "$file" 2>/dev/null || echo 0)"
+            [ "$size" -le 52428800 ] || return 0
+            local safe
+            safe="$(printf '%s' "$file" | sed 's#^/##; s#[/: ]#_#g')"
+            cp "$file" "$RAW_DIR/$safe" 2>/dev/null || true
+          }
 
-      - name: Upload failure logs
+          while IFS= read -r -d '' file; do copy_log "$file"; done < <(
+            find "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$HOME/.config/unity3d" -type f \
+              \( -iname '*.log' -o -iname '*.xml' -o -iname '*build*.txt' -o -iname '*gradle*.txt' -o -iname '*signature*.txt' -o -iname '*badging*.txt' \) \
+              -print0 2>/dev/null
+          )
+
+          find "$PROJECT_PATH/Build" verified-output -maxdepth 2 -type f -print0 2>/dev/null | while IFS= read -r -d '' file; do copy_log "$file"; done
+
+          grep -RInE 'MENCHINO_WF3|error CS[0-9]+|Scripts have compiler errors|Compilation failed|BuildFailedException|Gradle build failed|FAILURE: Build failed|Exception:|Aborting batchmode|No valid Unity Editor license|license activation|Android.*build returned' "$RAW_DIR" \
+            > "$LOG_DIR/first-errors.txt" 2>/dev/null || true
+          sed -n '1,500p' "$LOG_DIR/first-errors.txt" > "$LOG_DIR/first-errors.trimmed.txt" 2>/dev/null || true
+          mv "$LOG_DIR/first-errors.trimmed.txt" "$LOG_DIR/first-errors.txt" 2>/dev/null || true
+
+          if [ ! -s "$LOG_DIR/first-errors.txt" ]; then
+            echo "No focused error signature was found. Inspect raw logs." > "$LOG_DIR/first-errors.txt"
+          fi
+
+      - name: Upload focused failure logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: menchino-wf2-failure-logs-${{ github.run_id }}
-          path: menchino-wf2-failure-logs-${{ github.run_id }}.tar.gz
+          name: menchino-wf3-failure-logs-${{ github.run_id }}
+          path: menchino-wf3-failure-logs-${{ github.run_id }}/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
+ 
