@@ -1,1065 +1,309 @@
-# Menchino Workflow Number: WF-23
-# Signature: MENCHINO-WF23-20260721-R1
-# Supersedes: WF-22
-name: Menchino Android Build WF-23 Builtin Shader Pruning
-run-name: "Menchino WF-23 • Run ${{ github.run_number }} • ${{ github.ref_name }}"
+name: Menchino Android Store Build WF-2
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [main]
     paths:
-      - '**/menchino_unity_v*.zip'
-      - '.github/workflows/menchino-build-wf23.yml'
+      - '*.zip'
+      - '.github/workflows/menchino-build-wf2.yml'
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 concurrency:
-  group: menchino-wf23-builtin-shader-pruning-${{ github.ref }}
+  group: menchino-unity-wf2-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  WORKFLOW_NUMBER: WF-23
-  WORKFLOW_SIGNATURE: MENCHINO-WF23-20260721-R1
-  CI_ROOT: /mnt/menchino-ci
-  PROJECT_DIR: /mnt/menchino-ci/project
-  EXTRACT_DIR: /mnt/menchino-ci/extracted
-  LOG_DIR: /mnt/menchino-ci/logs
-  PACKAGE_DIR: /mnt/menchino-ci/package
-  FINAL_ZIP: /mnt/menchino-ci/package/Menchino-Android-Latest.zip
-  UNITY_IMAGE: unityci/editor:ubuntu-2022.3.62f1-android-3
+  UNITY_VERSION: 2022.3.62f1
+  PROJECT_PATH: unity-project
+  PACKAGE_NAME: mk.kadkhodai.menchino
+  VERSION_NAME: 0.1.0
+  VERSION_CODE: '2'
 
 jobs:
-  build-android:
-    name: WF-23 builtin-shader-pruning dual APK build
-    runs-on: ubuntu-22.04
-    timeout-minutes: 180
+  build-store-apks:
+    if: github.actor != 'github-actions[bot]'
+    name: WF-2 • Latest Unity ZIP • Bazaar + Myket
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7.0.0
+      - name: Checkout complete repository history
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           lfs: true
-          clean: true
           persist-credentials: true
 
-      - name: Prepare high-capacity storage for Docker and Unity
+      - name: Select latest valid Unity ZIP and extract project
+        id: prepare
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo mkdir -p "$LOG_DIR"
-          sudo chown -R "$(id -u):$(id -g)" "$CI_ROOT"
-          printf '%s\n' 'prepare-high-capacity-storage' > "$LOG_DIR/current-stage.txt"
-          exec > >(tee "$LOG_DIR/storage-preflight.log") 2>&1
-          trap 'code=$?; echo "storage_preflight_exit_code=$code"; echo "storage_preflight_failed_command=$BASH_COMMAND"; exit "$code"' ERR
+          shopt -s nullglob
+          rm -rf "$PROJECT_PATH" "$RUNNER_TEMP/menchino-zip-probe"
+          mkdir -p "$PROJECT_PATH" "$RUNNER_TEMP/menchino-zip-probe"
 
-          echo '=== Disk state before relocation ==='
-          df -hT / /mnt "$GITHUB_WORKSPACE" || true
-          docker info --format 'docker_root_before={{.DockerRootDir}}' || true
-          docker system df || true
+          mapfile -t CANDIDATES < <(
+            while IFS= read -r -d '' file; do
+              case "$(basename "$file")" in
+                *output*|*delivery*|*artifact*|*logs*|Unity_lic.zip|*keystore*.zip) continue ;;
+              esac
+              stamp="$(git log -1 --format=%ct -- "$file" 2>/dev/null || printf '0')"
+              printf '%s\t%s\n' "$stamp" "$file"
+            done < <(find . -maxdepth 1 -type f -name '*.zip' -print0)
+          )
 
-          sudo systemctl stop docker.service docker.socket 2>/dev/null || true
-          sudo systemctl stop containerd.service 2>/dev/null || true
-
-          # The GitHub-hosted VM is disposable. Move both Docker stores to /mnt,
-          # which has substantially more free space than the root filesystem.
-          sudo rm -rf /var/lib/docker /var/lib/containerd
-          sudo mkdir -p /var/lib/docker /var/lib/containerd
-          sudo rm -rf /mnt/menchino-docker-data /mnt/menchino-containerd-data
-          sudo mkdir -p /mnt/menchino-docker-data /mnt/menchino-containerd-data
-          sudo chmod 0711 /mnt/menchino-docker-data /mnt/menchino-containerd-data
-          sudo mount --bind /mnt/menchino-docker-data /var/lib/docker
-          sudo mount --bind /mnt/menchino-containerd-data /var/lib/containerd
-
-          sudo python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          path = Path('/etc/docker/daemon.json')
-          try:
-              data = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
-          except Exception as exc:
-              raise SystemExit(f'Invalid existing Docker daemon.json: {exc}')
-          if not isinstance(data, dict):
-              raise SystemExit('Docker daemon.json root must be an object.')
-          data['data-root'] = '/var/lib/docker'
-          path.parent.mkdir(parents=True, exist_ok=True)
-          path.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-          PY
-
-          sudo systemctl daemon-reload
-          sudo systemctl start containerd.service
-          sudo systemctl start docker.service
-
-          for attempt in {1..30}; do
-            docker info >/dev/null 2>&1 && break
-            sleep 2
-          done
-          docker info >/dev/null
-
-          mountpoint -q /var/lib/docker
-          mountpoint -q /var/lib/containerd
-          test "$(docker info --format '{{.DockerRootDir}}')" = '/var/lib/docker'
-
-          DOCKER_FREE_KB=$(df -Pk /var/lib/docker | awk 'NR==2 {print $4}')
-          MIN_FREE_KB=$((45 * 1024 * 1024))
-          if [ "$DOCKER_FREE_KB" -lt "$MIN_FREE_KB" ]; then
-            echo "Insufficient Docker storage after relocation: ${DOCKER_FREE_KB} KiB available; ${MIN_FREE_KB} KiB required." >&2
-            exit 41
+          if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+            echo "::error::هیچ ZIP کاندید در ریشه مخزن پیدا نشد."
+            exit 10
           fi
 
-          {
-            echo "workflow=$WORKFLOW_NUMBER"
-            echo "docker_root=$(docker info --format '{{.DockerRootDir}}')"
-            echo "docker_backing_source=$(findmnt -n -o SOURCE -T /var/lib/docker)"
-            echo "containerd_backing_source=$(findmnt -n -o SOURCE -T /var/lib/containerd)"
-            echo "docker_free_kb=$DOCKER_FREE_KB"
-            echo "minimum_required_kb=$MIN_FREE_KB"
-          } | tee "$LOG_DIR/storage-layout.txt"
+          SELECTED_ZIP=""
+          while IFS=$'\t' read -r _stamp zip_file; do
+            [ -n "$zip_file" ] || continue
+            probe="$RUNNER_TEMP/menchino-zip-probe/current"
+            rm -rf "$probe"
+            mkdir -p "$probe"
+            if ! unzip -q "$zip_file" -d "$probe"; then
+              echo "ZIP نامعتبر رد شد: $zip_file"
+              continue
+            fi
+            project_version="$(find "$probe" -type f -path '*/ProjectSettings/ProjectVersion.txt' -print -quit)"
+            if [ -n "$project_version" ]; then
+              SELECTED_ZIP="${zip_file#./}"
+              project_root="${project_version%/ProjectSettings/ProjectVersion.txt}"
+              cp -a "$project_root"/. "$PROJECT_PATH"/
+              break
+            fi
+          done < <(printf '%s\n' "${CANDIDATES[@]}" | sort -t $'\t' -k1,1nr -k2,2Vr)
 
-          echo '=== Disk state after relocation ==='
-          df -hT / /mnt /var/lib/docker /var/lib/containerd "$GITHUB_WORKSPACE"
-          docker info --format '{{json .}}' > "$LOG_DIR/docker-info-after-relocation.json"
-          echo 'WF-23 high-capacity storage preparation passed.'
+          if [ -z "$SELECTED_ZIP" ]; then
+            echo "::error::هیچ ZIP دارای ساختار معتبر پروژه Unity پیدا نشد."
+            exit 11
+          fi
 
-      - name: Bootstrap and verify WF-23 identity dynamically
+          test -f "$PROJECT_PATH/ProjectSettings/ProjectVersion.txt"
+          test -f "$PROJECT_PATH/Packages/manifest.json"
+          test -f "$PROJECT_PATH/Assets/Scenes/Bootstrap.unity"
+          test -f "$PROJECT_PATH/Assets/RoyalGame/Scripts/Editor/AndroidBuild.cs"
+          grep -Fq "m_EditorVersion: $UNITY_VERSION" "$PROJECT_PATH/ProjectSettings/ProjectVersion.txt"
+          grep -Fq "$PACKAGE_NAME" "$PROJECT_PATH/Assets/RoyalGame/Scripts/Editor/AndroidBuild.cs"
+
+          printf 'source_zip=%s\n' "$SELECTED_ZIP" >> "$GITHUB_OUTPUT"
+          printf 'Selected source ZIP: %s\n' "$SELECTED_ZIP"
+          printf 'Unity project: %s\n' "$PROJECT_PATH"
+
+      - name: Validate embedded Unity credentials and Android signing
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo mkdir -p "$CI_ROOT"
-          sudo chown -R "$(id -u):$(id -g)" "$CI_ROOT"
-          find "$CI_ROOT" -mindepth 1 -maxdepth 1 ! -name logs -exec rm -rf {} +
-          mkdir -p "$LOG_DIR" "$PACKAGE_DIR" "$EXTRACT_DIR"
-          printf '%s\n' 'bootstrap-dynamic-identity' > "$LOG_DIR/current-stage.txt"
-          exec > >(tee "$LOG_DIR/bootstrap.log") 2>&1
-          trap 'code=$?; echo "bootstrap_exit_code=$code"; echo "bootstrap_failed_command=$BASH_COMMAND"; exit "$code"' ERR
+          CREDS="$PROJECT_PATH/BuildCredentials/Unity/unity_credentials.env"
+          LICENSE="$PROJECT_PATH/BuildCredentials/Unity/Unity_lic.ulf"
+          SIGNING="$PROJECT_PATH/BuildCredentials/AndroidSigning/key.properties"
+          test -s "$CREDS"
+          test -s "$LICENSE"
+          test -s "$SIGNING"
+          set -a
+          # shellcheck disable=SC1090
+          source "$CREDS"
+          set +a
+          test -n "${UNITY_EMAIL:-}"
+          test -n "${UNITY_PASSWORD:-}"
+          echo "::add-mask::$UNITY_EMAIL"
+          echo "::add-mask::$UNITY_PASSWORD"
+          printf 'UNITY_EMAIL=%s\n' "$UNITY_EMAIL" >> "$GITHUB_ENV"
+          printf 'UNITY_PASSWORD=%s\n' "$UNITY_PASSWORD" >> "$GITHUB_ENV"
+          delimiter="UNITY_LICENSE_$(date +%s)_$RANDOM"
+          {
+            printf 'UNITY_LICENSE<<%s\n' "$delimiter"
+            cat "$LICENSE"
+            printf '\n%s\n' "$delimiter"
+          } >> "$GITHUB_ENV"
 
-          WORKFLOW_PATH="${GITHUB_WORKFLOW_REF#${GITHUB_REPOSITORY}/}"
-          WORKFLOW_PATH="${WORKFLOW_PATH%@*}"
-          if [[ "$WORKFLOW_PATH" != .github/workflows/*.yml && "$WORKFLOW_PATH" != .github/workflows/*.yaml ]]; then
-            echo "Invalid workflow path derived from GITHUB_WORKFLOW_REF: $WORKFLOW_PATH" >&2
+          STORE_PASSWORD="$(awk -F= '$1=="storePassword"{sub(/^[^=]*=/,""); print}' "$SIGNING")"
+          KEY_PASSWORD="$(awk -F= '$1=="keyPassword"{sub(/^[^=]*=/,""); print}' "$SIGNING")"
+          KEY_ALIAS="$(awk -F= '$1=="keyAlias"{sub(/^[^=]*=/,""); print}' "$SIGNING")"
+          STORE_FILE="$(awk -F= '$1=="storeFile"{sub(/^[^=]*=/,""); print}' "$SIGNING")"
+          test -n "$STORE_PASSWORD"
+          test -n "$KEY_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -s "$PROJECT_PATH/BuildCredentials/AndroidSigning/$STORE_FILE"
+          echo "::add-mask::$STORE_PASSWORD"
+          echo "::add-mask::$KEY_PASSWORD"
+          keytool -list -keystore "$PROJECT_PATH/BuildCredentials/AndroidSigning/$STORE_FILE" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          echo "Unity credentials, license XML and release keystore passed preflight."
+
+      - name: Restore Unity Library cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PROJECT_PATH }}/Library
+          key: menchino-unity-${{ env.UNITY_VERSION }}-wf2-${{ hashFiles('unity-project/Packages/**', 'unity-project/ProjectSettings/**', 'unity-project/Assets/**/*.cs') }}
+          restore-keys: |
+            menchino-unity-${{ env.UNITY_VERSION }}-wf2-
+
+      - name: Run Unity EditMode tests
+        uses: game-ci/unity-test-runner@v4
+        with:
+          projectPath: ${{ env.PROJECT_PATH }}
+          unityVersion: ${{ env.UNITY_VERSION }}
+          testMode: EditMode
+          artifactsPath: TestResults
+          checkName: Menchino EditMode Tests WF-2
+
+      - name: Build signed Bazaar APK
+        uses: game-ci/unity-builder@v4
+        with:
+          projectPath: ${{ env.PROJECT_PATH }}
+          unityVersion: ${{ env.UNITY_VERSION }}
+          targetPlatform: Android
+          buildMethod: Menchino.RoyalSnakes.Editor.AndroidBuild.BuildBazaar
+          androidExportType: androidPackage
+
+      - name: Build signed Myket APK
+        uses: game-ci/unity-builder@v4
+        with:
+          projectPath: ${{ env.PROJECT_PATH }}
+          unityVersion: ${{ env.UNITY_VERSION }}
+          targetPlatform: Android
+          buildMethod: Menchino.RoyalSnakes.Editor.AndroidBuild.BuildMyket
+          androidExportType: androidPackage
+
+      - name: Verify exactly two signed store APKs
+        id: verify
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BAZAAR="$PROJECT_PATH/Build/Menchino-v${VERSION_NAME}-build${VERSION_CODE}-bazaar.apk"
+          MYKET="$PROJECT_PATH/Build/Menchino-v${VERSION_NAME}-build${VERSION_CODE}-myket.apk"
+          test -s "$BAZAAR"
+          test -s "$MYKET"
+
+          mapfile -t APKS < <(find "$PROJECT_PATH/Build" -maxdepth 1 -type f -name '*.apk' -print | sort)
+          if [ "${#APKS[@]}" -ne 2 ]; then
+            printf 'Expected exactly 2 APKs, found %s:\n' "${#APKS[@]}" >&2
+            printf ' - %s\n' "${APKS[@]}" >&2
+            exit 30
+          fi
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner -print | sort -V | tail -n 1)"
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt -print | sort -V | tail -n 1)"
+          test -x "$APKSIGNER"
+          test -x "$AAPT"
+
+          for apk in "$BAZAAR" "$MYKET"; do
+            unzip -tq "$apk" >/dev/null
+            "$APKSIGNER" verify --verbose --print-certs "$apk" > "${apk%.apk}.signature.txt"
+            "$AAPT" dump badging "$apk" > "${apk%.apk}.badging.txt"
+            grep -Fq "package: name='$PACKAGE_NAME'" "${apk%.apk}.badging.txt"
+            grep -Fq "versionCode='$VERSION_CODE'" "${apk%.apk}.badging.txt"
+          done
+
+          if cmp -s "$BAZAAR" "$MYKET"; then
+            echo "::error::دو APK کاملاً یکسان هستند؛ تفکیک کانال فروشگاه اعمال نشده است."
             exit 31
           fi
-          if [ ! -f "$WORKFLOW_PATH" ]; then
-            echo "Executed workflow file is missing from checkout: $WORKFLOW_PATH" >&2
-            find .github/workflows -maxdepth 1 -type f -print | sort || true
-            exit 32
-          fi
 
-          {
-            echo "workflow_number=$WORKFLOW_NUMBER"
-            echo "workflow_signature=$WORKFLOW_SIGNATURE"
-            echo "workflow_name=$GITHUB_WORKFLOW"
-            echo "workflow_ref=$GITHUB_WORKFLOW_REF"
-            echo "workflow_file=$WORKFLOW_PATH"
-            echo "run_id=$GITHUB_RUN_ID"
-            echo "run_number=$GITHUB_RUN_NUMBER"
-            echo "repository=$GITHUB_REPOSITORY"
-            echo "ref=$GITHUB_REF"
-            echo "commit=$GITHUB_SHA"
-            echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } | tee "$LOG_DIR/wf23-identity.txt"
+          mkdir -p verified-output
+          cp "$BAZAAR" "$MYKET" verified-output/
+          (cd verified-output && sha256sum *.apk > SHA256SUMS.txt)
+          test "$(find verified-output -maxdepth 1 -type f -name '*.apk' | wc -l)" -eq 2
 
-          grep -Fq 'name: Menchino Android Build WF-23 Builtin Shader Pruning' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_NUMBER: WF-23' "$WORKFLOW_PATH"
-          grep -Fq 'WORKFLOW_SIGNATURE: MENCHINO-WF23-20260721-R1' "$WORKFLOW_PATH"
-          sha256sum "$WORKFLOW_PATH" | tee "$LOG_DIR/wf23-workflow-sha256.txt"
-          printf '%s\n' "$WORKFLOW_PATH" > "$LOG_DIR/executed-workflow-path.txt"
-          echo 'WF-23 bootstrap identity verification passed.'
-
-      - name: Pull and verify Git LFS objects
+      - name: Remove prior GitHub outputs and rewrite repository as one clean snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ZIP: ${{ steps.prepare.outputs.source_zip }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          printf '%s\n' 'git-lfs' > "$LOG_DIR/current-stage.txt"
-          git lfs install --local
-          git lfs pull 2>&1 | tee "$LOG_DIR/git-lfs.log"
-          if grep -RIl --exclude-dir=.git --exclude-dir=.menchino-ci \
-              '^version https://git-lfs.github.com/spec/v1$' . > "$LOG_DIR/unresolved-lfs-pointers.txt"; then
-            echo 'Unresolved Git LFS pointer files remain.' | tee -a "$LOG_DIR/git-lfs.log"
-            cat "$LOG_DIR/unresolved-lfs-pointers.txt" | tee -a "$LOG_DIR/git-lfs.log"
-            exit 21
-          fi
+          PUBLISH="$RUNNER_TEMP/menchino-clean-snapshot"
+          rm -rf "$PUBLISH"
+          mkdir -p "$PUBLISH/.github/workflows" "$PUBLISH/output"
 
-      - name: Find latest valid Menchino Unity ZIP
-        id: source
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          printf '%s\n' 'select-source' > "$LOG_DIR/current-stage.txt"
-          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/source-selection.log"
-          from __future__ import annotations
+          cp "$SOURCE_ZIP" "$PUBLISH/$(basename "$SOURCE_ZIP")"
+          cp ".github/workflows/menchino-build-wf2.yml" "$PUBLISH/.github/workflows/menchino-build-wf2.yml"
+          cp verified-output/*.apk "$PUBLISH/output/"
+          test "$(find "$PUBLISH/output" -maxdepth 1 -type f -name '*.apk' | wc -l)" -eq 2
 
-          import hashlib
-          import json
-          import os
-          import re
-          import subprocess
-          import zipfile
-          from pathlib import Path, PurePosixPath
-
-          repo = Path('.').resolve()
-          excluded = {'.git', '.menchino-ci', 'Library', 'Temp', 'Builds'}
-          filename_rx = re.compile(r'(?i)^menchino_unity_v(\d+)\.(\d+)\.(\d+).*\.zip$')
-          lfs_header = b'version https://git-lfs.github.com/spec/v1'
-
-          def git_timestamp(path: Path) -> int:
-              try:
-                  result = subprocess.run(
-                      ['git', 'log', '-1', '--format=%ct', '--', path.as_posix()],
-                      check=True,
-                      capture_output=True,
-                      text=True,
-                  )
-                  return int(result.stdout.strip() or '0')
-              except Exception:
-                  return 0
-
-          def unity_roots(names: list[str]) -> list[str]:
-              normalized = {
-                  name.replace('\\', '/').strip('/')
-                  for name in names
-                  if name and name.strip('/')
-              }
-              roots: set[str] = set()
-              for name in normalized:
-                  parts = PurePosixPath(name).parts
-                  if len(parts) < 2 or parts[-2:] != ('Packages', 'manifest.json'):
-                      continue
-                  prefix = '/'.join(parts[:-2])
-                  base = f'{prefix}/' if prefix else ''
-                  has_project_version = f'{base}ProjectSettings/ProjectVersion.txt' in normalized
-                  has_assets = any(
-                      candidate == f'{base}Assets' or candidate.startswith(f'{base}Assets/')
-                      for candidate in normalized
-                  )
-                  if has_project_version and has_assets:
-                      roots.add(prefix)
-              return sorted(roots)
-
-          records: list[dict[str, object]] = []
-          accepted: list[tuple[tuple[int, int, int], int, str, Path, str, str]] = []
-
-          for archive in sorted(repo.rglob('*.zip'), key=lambda p: p.as_posix().lower()):
-              relative = archive.relative_to(repo)
-              if any(part in excluded for part in relative.parts):
-                  continue
-
-              record: dict[str, object] = {'path': relative.as_posix(), 'bytes': archive.stat().st_size}
-              match = filename_rx.match(archive.name)
-              if not match:
-                  record.update(status='rejected', reason='filename_not_versioned_menchino_source')
-                  records.append(record)
-                  continue
-
-              if archive.read_bytes()[:128].startswith(lfs_header):
-                  record.update(status='rejected', reason='unresolved_git_lfs_pointer')
-                  records.append(record)
-                  continue
-
-              try:
-                  with zipfile.ZipFile(archive) as zf:
-                      corrupt = zf.testzip()
-                      if corrupt:
-                          raise RuntimeError(f'corrupt_member:{corrupt}')
-                      names = zf.namelist()
-                      roots = unity_roots(names)
-                      record['zip_member_count'] = len(names)
-              except Exception as exc:
-                  record.update(status='rejected', reason=f'invalid_zip:{exc}')
-                  records.append(record)
-                  continue
-
-              if len(roots) != 1:
-                  record.update(status='rejected', reason=f'unity_root_count:{len(roots)}', roots=roots)
-                  records.append(record)
-                  continue
-
-              version = tuple(map(int, match.groups()))
-              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-              timestamp = git_timestamp(relative)
-              root = roots[0]
-              record.update(
-                  status='accepted',
-                  version='.'.join(map(str, version)),
-                  unity_root=root,
-                  git_timestamp=timestamp,
-                  sha256=digest,
-              )
-              records.append(record)
-              accepted.append((version, timestamp, relative.as_posix(), archive, root, digest))
-
-          Path(os.environ['LOG_DIR'], 'zip-candidates.json').write_text(
-              json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8'
-          )
-          print(json.dumps(records, ensure_ascii=False, indent=2))
-
-          if not accepted:
-              raise SystemExit('No valid versioned Menchino Unity source ZIP was found.')
-
-          version, timestamp, relative_name, archive, root, digest = max(
-              accepted, key=lambda item: (item[0], item[1], item[2])
-          )
-          version_text = '.'.join(map(str, version))
-          env_text = (
-              f'SOURCE_ZIP={relative_name}\n'
-              f'SOURCE_VERSION={version_text}\n'
-              f'SOURCE_UNITY_ROOT={root}\n'
-              f'SOURCE_SHA256={digest}\n'
-          )
-          Path(os.environ['LOG_DIR'], 'source.env').write_text(env_text, encoding='utf-8')
-          print(env_text, end='')
-          PY
-
-          source "$LOG_DIR/source.env"
-          {
-            echo "SOURCE_ZIP=$SOURCE_ZIP"
-            echo "SOURCE_VERSION=$SOURCE_VERSION"
-            echo "SOURCE_UNITY_ROOT=$SOURCE_UNITY_ROOT"
-            echo "SOURCE_SHA256=$SOURCE_SHA256"
-          } >> "$GITHUB_ENV"
-          {
-            echo "zip=$SOURCE_ZIP"
-            echo "version=$SOURCE_VERSION"
-            echo "root=$SOURCE_UNITY_ROOT"
-            echo "sha256=$SOURCE_SHA256"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Extract selected Unity project safely
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          printf '%s\n' 'extract-source' > "$LOG_DIR/current-stage.txt"
-          rm -rf "$EXTRACT_DIR" "$PROJECT_DIR"
-          mkdir -p "$EXTRACT_DIR"
-
-          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/extraction.log"
-          from __future__ import annotations
-
-          import os
-          import shutil
-          import stat
-          import zipfile
-          from pathlib import Path, PurePosixPath
-
-          archive = Path(os.environ['SOURCE_ZIP'])
-          extract_dir = Path(os.environ['EXTRACT_DIR'])
-          project_dir = Path(os.environ['PROJECT_DIR'])
-          expected_root = os.environ['SOURCE_UNITY_ROOT'].strip('/')
-
-          with zipfile.ZipFile(archive) as zf:
-              seen: set[str] = set()
-              for info in zf.infolist():
-                  raw = info.filename.replace('\\', '/')
-                  path = PurePosixPath(raw)
-                  if raw.startswith('/') or path.is_absolute() or '..' in path.parts:
-                      raise SystemExit(f'Unsafe ZIP path: {raw}')
-                  normalized = path.as_posix().rstrip('/')
-                  if normalized in seen:
-                      raise SystemExit(f'Duplicate ZIP member: {normalized}')
-                  seen.add(normalized)
-                  mode = info.external_attr >> 16
-                  if stat.S_ISLNK(mode):
-                      raise SystemExit(f'Symlink is not allowed: {raw}')
-              zf.extractall(extract_dir)
-
-          source_root = extract_dir / expected_root if expected_root else extract_dir
-          required = [
-              source_root / 'Assets',
-              source_root / 'Packages' / 'manifest.json',
-              source_root / 'ProjectSettings' / 'ProjectVersion.txt',
-              source_root / '.unity-ci' / 'Unity_lic.ulf',
-              source_root / '.unity-ci' / 'unity_credentials.env',
-          ]
-          missing = [str(path) for path in required if not path.exists()]
-          if missing:
-              raise SystemExit('Missing required project paths: ' + ', '.join(missing))
-
-          shutil.copytree(source_root, project_dir)
-          print(f'project_source={source_root}')
-          print(f'project_destination={project_dir}')
-          print(f'project_file_count={sum(1 for p in project_dir.rglob("*") if p.is_file())}')
-          PY
-
-          {
-            echo "source_zip=$SOURCE_ZIP"
-            echo "source_version=$SOURCE_VERSION"
-            echo "source_sha256=$SOURCE_SHA256"
-            echo "unity_editor=$(sed -n 's/^m_EditorVersion: //p' "$PROJECT_DIR/ProjectSettings/ProjectVersion.txt")"
-            echo "project_file_count=$(find "$PROJECT_DIR" -type f | wc -l)"
-          } | tee "$LOG_DIR/project-validation.txt"
-
-      - name: Validate Unity package modules and source dependencies
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          printf '%s\n' 'dependency-preflight' > "$LOG_DIR/current-stage.txt"
-          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/dependency-preflight.log"
-          from __future__ import annotations
-
-          import json
-          import os
-          import re
-          from pathlib import Path
-
-          project = Path(os.environ['PROJECT_DIR'])
-          manifest_path = project / 'Packages' / 'manifest.json'
-          asmdef_path = project / 'Assets' / 'Scripts' / 'Menchino.Runtime.asmdef'
-          scripts_root = project / 'Assets'
-
-          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-          dependencies = manifest.get('dependencies')
-          if not isinstance(dependencies, dict):
-              raise SystemExit('Packages/manifest.json has no dependencies object.')
-
-          required = {
-              'com.unity.ugui': 'UnityEngine.UI/EventSystems',
-              'com.unity.modules.androidjni': 'AndroidJavaClass/AndroidJavaObject',
-              'com.unity.modules.audio': 'AudioSource/AudioClip/AudioListener',
-              'com.unity.modules.imgui': 'GUIUtility clipboard fallback',
-              'com.unity.modules.jsonserialize': 'JsonUtility',
-              'com.unity.modules.physics': 'Collider and primitive collider cleanup',
-              'com.unity.modules.ui': 'Canvas/CanvasRenderer',
-          }
-          missing = [name for name in required if dependencies.get(name) != '1.0.0']
-          if missing:
-              detail = ', '.join(f'{name} ({required[name]})' for name in missing)
-              raise SystemExit('Required Unity packages are missing or not pinned to 1.0.0: ' + detail)
-
-          # Legacy Input Manager is part of the Unity Editor/Player, not a UPM package.
-          # com.unity.modules.inputlegacy does not exist in Unity 2022.3 and makes
-          # Package Manager reject the whole project before compilation.
-          forbidden = {
-              'com.unity.modules.inputlegacy': (
-                  'Legacy Input Manager is built into Unity; StandaloneInputModule is provided by com.unity.ugui.'
-              ),
-          }
-          present_forbidden = [name for name in forbidden if name in dependencies]
-          if present_forbidden:
-              detail = ', '.join(f'{name} ({forbidden[name]})' for name in present_forbidden)
-              raise SystemExit('Invalid Unity package dependencies must be removed: ' + detail)
-
-          source = '\n'.join(
-              path.read_text(encoding='utf-8', errors='replace')
-              for path in sorted(scripts_root.rglob('*.cs'))
-          )
-          evidence = {
-              'com.unity.modules.physics': [r'\bCollider\b'],
-              'com.unity.modules.audio': [r'\bAudioSource\b', r'\bAudioClip\b', r'\bAudioListener\b'],
-              'com.unity.modules.androidjni': [r'\bAndroidJavaClass\b', r'\bAndroidJavaObject\b'],
-              'com.unity.modules.imgui': [r'\bGUIUtility\b'],
-              'com.unity.modules.jsonserialize': [r'\bJsonUtility\b'],
-              'com.unity.modules.ui': [r'\bCanvas\b', r'\bCanvasRenderer\b'],
-          }
-          for package_name, patterns in evidence.items():
-              hits = [pattern for pattern in patterns if re.search(pattern, source)]
-              if hits and package_name not in dependencies:
-                  raise SystemExit(
-                      f'Source uses {hits}, but {package_name} is absent from Packages/manifest.json.')
-
-          asmdef = json.loads(asmdef_path.read_text(encoding='utf-8'))
-          references = asmdef.get('references', [])
-          if 'Unity.ugui' not in references:
-              raise SystemExit('Menchino.Runtime.asmdef does not reference Unity.ugui.')
-
-          build_configurator = (project / 'Assets' / 'Editor' / 'MenchinoBuildConfigurator.cs').read_text(encoding='utf-8')
-          ui_factory = (project / 'Assets' / 'Scripts' / 'Presentation' / 'UiFactory.cs').read_text(encoding='utf-8')
-          world_factory = (project / 'Assets' / 'Scripts' / 'Presentation' / 'WorldFactory.cs').read_text(encoding='utf-8')
-          app_source = (project / 'Assets' / 'Scripts' / 'Core' / 'MenchinoApp.cs').read_text(encoding='utf-8')
-
-          ui_shader_source = (project / 'Assets' / 'Shaders' / 'MenchinoRuntimeUI.shader').read_text(encoding='utf-8')
-          world_shader_source = (project / 'Assets' / 'Shaders' / 'MenchinoRuntimeWorld.shader').read_text(encoding='utf-8')
-
-          retain_method_match = re.search(
-              r'private static void RetainRuntimeShaders\(\)\s*\{(?P<body>.*?)\n        \}\n\n        private static void EnsureRuntimeMaterialAssets',
-              build_configurator,
-              re.DOTALL,
-          )
-          if retain_method_match is None:
-              raise SystemExit('Could not isolate RetainRuntimeShaders() for validation.')
-          retain_method_body = retain_method_match.group('body')
-
-          shader_requirements = {
-              'custom_ui_shader_asset_present': (
-                  'Shader "Menchino/RuntimeUI"' in ui_shader_source
-              ),
-              'custom_world_shader_asset_present': (
-                  'Shader "Menchino/RuntimeWorld"' in world_shader_source
-              ),
-              'ui_shader_is_self_contained': (
-                  'Fallback Off' in ui_shader_source and
-                  'Fallback "UI/Default"' not in ui_shader_source
-              ),
-              'world_shader_is_compact_vertex_fragment': (
-                  'Fallback Off' in world_shader_source and
-                  '#pragma surface' not in world_shader_source and
-                  'Fallback "Standard"' not in world_shader_source
-              ),
-              'build_configurator_prunes_builtin_always_included_shaders': (
-                  'includedShaders.ClearArray();' in retain_method_body and
-                  'AssetDatabase.LoadAssetAtPath<Shader>' in retain_method_body and
-                  'optionalShaderNames' not in retain_method_body and
-                  'Shader.Find(' not in retain_method_body
-              ),
-              'runtime_factories_do_not_use_builtin_shader_fallbacks': (
-                  '"GUI/Text Shader"' not in ui_factory and
-                  '"UI/Default"' not in ui_factory and
-                  '"Sprites/Default"' not in ui_factory and
-                  '"Standard"' not in world_factory and
-                  '"Mobile/Diffuse"' not in world_factory and
-                  '"Unlit/Color"' not in world_factory
-              ),
-              'build_configurator_creates_persistent_materials': (
-                  'EnsureRuntimeMaterialAssets();' in build_configurator and
-                  'MenchinoRuntimeUI.mat' in build_configurator and
-                  'MenchinoRuntimeText.mat' in build_configurator and
-                  'MenchinoRuntimeWorld.mat' in build_configurator
-              ),
-              'ui_loads_persistent_resources_materials': (
-                  'RuntimeMaterials/MenchinoRuntimeUI' in ui_factory and
-                  'RuntimeMaterials/MenchinoRuntimeText' in ui_factory and
-                  'Resources.Load<Material>' in ui_factory
-              ),
-              'ui_images_use_explicit_material': 'image.material = RuntimeUiMaterial' in ui_factory,
-              'ui_text_uses_explicit_material': 'uiText.material = RuntimeTextMaterial' in ui_factory,
-              'runtime_shader_guard_runs_at_boot': 'UiFactory.EnsureRuntimeShaders();' in app_source,
-              'world_loads_persistent_resources_material': (
-                  'RuntimeMaterials/MenchinoRuntimeWorld' in world_factory and
-                  'Resources.Load<Material>' in world_factory
-              ),
-              'world_has_no_urp_shader_lookup': 'Universal Render Pipeline/Lit' not in world_factory,
-          }
-          failed_shader_requirements = [name for name, passed in shader_requirements.items() if not passed]
-          if failed_shader_requirements:
-              raise SystemExit(
-                  'Runtime shader-retention preflight failed: ' + ', '.join(failed_shader_requirements))
-
-          print('workflow=WF-23')
-          print('manifest_json=valid')
-          print('required_package_count=' + str(len(required)))
-          for package_name in sorted(required):
-              print(f'package={package_name};version={dependencies[package_name]};reason={required[package_name]}')
-          for package_name in sorted(forbidden):
-              print(f'forbidden_package_absent={package_name};reason={forbidden[package_name]}')
-          print('legacy_input_manager=editor_builtin_not_upm_package')
-          print('standalone_input_module_provider=com.unity.ugui')
-          print('asmdef_unity_ugui_reference=present')
-          for check_name in sorted(shader_requirements):
-              print(f'shader_check={check_name};status=passed')
-          print('runtime_shader_retention=passed')
-          print('dependency_preflight=passed')
-          PY
-
-      - name: Prepare embedded activation files
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          printf '%s\n' 'prepare-activation' > "$LOG_DIR/current-stage.txt"
-          python3 - <<'PY'
-          from __future__ import annotations
-
-          import base64
-          import hashlib
-          import os
-          import re
-          import xml.etree.ElementTree as ET
-          from pathlib import Path
-
-          project = Path(os.environ['PROJECT_DIR'])
-          logs = Path(os.environ['LOG_DIR'])
-          license_path = project / '.unity-ci' / 'Unity_lic.ulf'
-          credentials_path = project / '.unity-ci' / 'unity_credentials.env'
-          runtime_env = Path(os.environ['CI_ROOT']) / 'runtime-unity.env'
-
-          license_text = license_path.read_text(encoding='utf-8').strip()
-          if len(license_text.encode('utf-8')) < 256:
-              raise SystemExit('Embedded Unity license is unexpectedly small.')
-          root = ET.fromstring(license_text)
-          developer_data = root.find('.//DeveloperData')
-          if developer_data is None or not developer_data.attrib.get('Value'):
-              raise SystemExit('Unity license has no DeveloperData payload.')
-          decoded = base64.b64decode(developer_data.attrib['Value']).decode('utf-8', errors='ignore')
-          serial_match = re.search(r'[A-Z0-9]{2}(?:-[A-Z0-9]{4}){5}', decoded)
-          if serial_match is None:
-              raise SystemExit('Unity serial format could not be decoded.')
-          serial = serial_match.group(0)
-
-          credentials: dict[str, str] = {}
-          for raw in credentials_path.read_text(encoding='utf-8').splitlines():
-              line = raw.strip()
-              if not line or line.startswith('#'):
-                  continue
-              if '=' not in line:
-                  raise SystemExit('Malformed unity_credentials.env line.')
-              key, value = line.split('=', 1)
-              credentials[key.strip()] = value.strip()
-
-          email = credentials.get('UNITY_EMAIL', '')
-          password = credentials.get('UNITY_PASSWORD', '')
-          if not email or not password:
-              raise SystemExit('Embedded Unity credentials are incomplete.')
-          if any('\n' in value or '\r' in value or '\x00' in value for value in (serial, email, password)):
-              raise SystemExit('Activation values contain invalid control characters.')
-
-          for protected in (serial, email, password):
-              print(f'::add-mask::{protected}')
-
-          runtime_env.write_text(
-              f'UNITY_SERIAL={serial}\nUNITY_EMAIL={email}\nUNITY_PASSWORD={password}\n',
-              encoding='utf-8',
-          )
-          runtime_env.chmod(0o600)
-
-          (logs / 'activation-validation.txt').write_text(
-              'workflow=WF-23\n'
-              'activation_strategy=builtin-shader-pruning-preflight;clean-home;online-personal-activation;single-container-build\n'
-              'game_ci_builder_used=false\n'
-              'github_unity_secrets_used=false\n'
-              f'license_bytes={len(license_text.encode("utf-8"))}\n'
-              f'license_sha256={hashlib.sha256(license_text.encode("utf-8")).hexdigest()}\n'
-              f'serial_loaded=true;length={len(serial)}\n'
-              f'email_loaded=true;length={len(email)}\n'
-              f'password_loaded=true;length={len(password)}\n',
-              encoding='utf-8',
-          )
-          PY
-          test -s "$CI_ROOT/runtime-unity.env"
-          test "$(stat -c '%a' "$CI_ROOT/runtime-unity.env")" = '600'
-
-      - name: Pull pinned Unity Android image on high-capacity storage
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          printf '%s\n' 'pull-unity-image-high-capacity' > "$LOG_DIR/current-stage.txt"
-          {
-            echo "docker_root=$(docker info --format '{{.DockerRootDir}}')"
-            findmnt -T /var/lib/docker
-            df -hT / /mnt /var/lib/docker /var/lib/containerd
-            docker system df
-          } | tee "$LOG_DIR/docker-storage-before-pull.txt"
-
-          pull_exit=1
-          : > "$LOG_DIR/docker-pull.log"
-          for attempt in 1 2 3; do
-            echo "docker_pull_attempt=$attempt" | tee -a "$LOG_DIR/docker-pull.log"
-            set +e
-            docker pull "$UNITY_IMAGE" 2>&1 | tee -a "$LOG_DIR/docker-pull.log"
-            pull_exit=${PIPESTATUS[0]}
-            set -e
-            [ "$pull_exit" -eq 0 ] && break
-            docker system df | tee -a "$LOG_DIR/docker-pull.log" || true
-            df -hT / /mnt /var/lib/docker /var/lib/containerd | tee -a "$LOG_DIR/docker-pull.log" || true
-            sleep $((attempt * 10))
+          # Delete previous Actions artifacts.
+          mapfile -t artifact_ids < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '.artifacts[].id' || true)
+          for id in "${artifact_ids[@]:-}"; do
+            [ -n "$id" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
           done
-          if [ "$pull_exit" -ne 0 ]; then
-            echo "Unity image pull failed after 3 attempts; exit=$pull_exit" >&2
-            exit "$pull_exit"
-          fi
 
-          docker image inspect "$UNITY_IMAGE" > "$LOG_DIR/docker-image-inspect.json"
-          {
-            docker system df
-            df -hT / /mnt /var/lib/docker /var/lib/containerd
-          } | tee "$LOG_DIR/docker-storage-after-pull.txt"
+          # Delete previous workflow runs, except the currently executing run.
+          mapfile -t run_ids < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100" --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID) | .id" || true)
+          for id in "${run_ids[@]:-}"; do
+            [ -n "$id" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" || true
+          done
 
-      - name: Build exactly two APKs with clean online activation
-        id: unity_build
+          # Delete previous releases and tags.
+          mapfile -t release_ids < <(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].id' || true)
+          for id in "${release_ids[@]:-}"; do
+            [ -n "$id" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+          done
+          mapfile -t tags < <(git tag -l)
+          for tag in "${tags[@]:-}"; do
+            [ -n "$tag" ] && git push origin ":refs/tags/$tag"
+          done
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan menchino-clean-snapshot
+          git rm -rf . >/dev/null 2>&1 || true
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a "$PUBLISH"/. .
+          git add -f .
+          git commit -m "Menchino v${VERSION_NAME}+${VERSION_CODE} clean store outputs [skip ci]"
+          git branch -M "$GITHUB_REF_NAME"
+          git push --force origin "HEAD:$GITHUB_REF_NAME"
+
+          echo "Repository branch was replaced by one orphan snapshot commit."
+          echo "The output directory contains exactly the Bazaar and Myket APK files."
+
+      - name: Collect complete failure diagnostics
+        if: failure()
         shell: bash
-        run: |
-          set -Eeuo pipefail
-          printf '%s\n' 'clean-online-activation-and-build' > "$LOG_DIR/current-stage.txt"
-          rm -rf "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs" "$CI_ROOT/unity-home"
-          mkdir -p "$PROJECT_DIR/Builds/Android" "$PROJECT_DIR/Builds/Logs"
-          mkdir -p "$CI_ROOT/unity-home/.cache/unity3d"
-          mkdir -p "$CI_ROOT/unity-home/.config/unity3d"
-          mkdir -p "$CI_ROOT/unity-home/.local/share/unity3d/Unity"
-          chmod -R u+rwX,go-rwx "$CI_ROOT/unity-home"
-
-          cat > "$CI_ROOT/run-unity-wf23.sh" <<'BASH'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-
-          UNITY_BIN=/opt/unity/Editor/Unity
-          CI_MOUNT=/menchino-ci
-          PROJECT="$CI_MOUNT/project"
-          LOGS="$CI_MOUNT/logs"
-          HOME=/root
-          export HOME
-          export XDG_CACHE_HOME=/root/.cache
-          export XDG_CONFIG_HOME=/root/.config
-          export XDG_DATA_HOME=/root/.local/share
-
-          LICENSE_HOME=/root/.local/share/unity3d/Unity
-          mkdir -p \
-            /root/.cache/unity3d \
-            /root/.config/unity3d \
-            "$LICENSE_HOME" \
-            "$LOGS" \
-            "$PROJECT/Builds/Android" \
-            "$PROJECT/Builds/Logs"
-          chmod -R u+rwX,go-rwx /root/.cache /root/.config /root/.local
-
-          # The embedded ULF was generated for another machine. Never install it
-          # on the ephemeral runner. It is used only outside this script to
-          # decode the account serial. Remove every stale/invalid license copy
-          # before the online activation attempt.
-          find /root/.local/share/unity3d /root/.config/unity3d /root/.cache/unity3d \
-            -type f \( -iname 'Unity_lic.ulf' -o -iname '*.ulf' -o -iname '*license*.xml' \) \
-            -delete 2>/dev/null || true
-          rm -f \
-            /root/.local/share/unity3d/Unity/Unity_lic.ulf \
-            /root/.config/unity3d/Unity/Unity_lic.ulf \
-            2>/dev/null || true
-
-          {
-            echo "workflow=WF-23"
-            echo "home=$HOME"
-            echo "xdg_cache=$XDG_CACHE_HOME"
-            echo "xdg_config=$XDG_CONFIG_HOME"
-            echo "xdg_data=$XDG_DATA_HOME"
-            echo "stale_license_files_before_activation=0"
-            find /root/.local/share/unity3d /root/.config/unity3d /root/.cache/unity3d \
-              -type f -maxdepth 5 -printf '%p|%s\n' 2>/dev/null | sort || true
-          } > "$LOGS/clean-activation-preflight.txt"
-
-          run_unity() {
-            local label="$1"
-            shift
-            echo "[WF-23] START $label $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            set +e
-            xvfb-run -a "$UNITY_BIN" "$@"
-            local code=$?
-            set -e
-            echo "[WF-23] END $label exit=$code $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            return "$code"
-          }
-
-          ACTIVATION_EXIT=0
-          run_unity online-personal-activation-clean-home \
-            -batchmode -nographics -quit \
-            -username "$UNITY_EMAIL" \
-            -password "$UNITY_PASSWORD" \
-            -serial "$UNITY_SERIAL" \
-            -logFile "$LOGS/unity-online-activation-clean.log" || ACTIVATION_EXIT=$?
-          echo "online_activation_exit=$ACTIVATION_EXIT" > "$LOGS/activation-attempts.txt"
-
-          {
-            echo "activation_exit=$ACTIVATION_EXIT"
-            echo "license_files_after_activation:"
-            find /root/.local/share/unity3d /root/.config/unity3d \
-              -type f -maxdepth 6 -printf '%p|%s\n' 2>/dev/null | sort || true
-          } > "$LOGS/license-state-after-activation.txt"
-
-          ACTIVATED=false
-          if grep -Eiq \
-            'Successfully activated the entitlement license|License is successfully updated|License.*activated successfully' \
-            "$LOGS/unity-online-activation-clean.log" 2>/dev/null; then
-            ACTIVATED=true
-          fi
-          if find /root/.local/share/unity3d /root/.config/unity3d \
-              -type f \( -iname 'Unity_lic.ulf' -o -iname '*.ulf' -o -iname '*license*.xml' \) \
-              -size +100c -print -quit 2>/dev/null | grep -q .; then
-            ACTIVATED=true
-          fi
-          echo "activation_detected=$ACTIVATED" >> "$LOGS/activation-attempts.txt"
-
-          if [ "$ACTIVATION_EXIT" -ne 0 ] && [ "$ACTIVATED" != true ]; then
-            echo 'activation_mode=clean-online-activation-failed' >> "$LOGS/activation-attempts.txt"
-            exit "$ACTIVATION_EXIT"
-          fi
-
-          BUILD_EXIT=0
-          run_unity build-after-clean-online-activation \
-            -batchmode -nographics -quit -force-free \
-            -projectPath "$PROJECT" \
-            -buildTarget Android \
-            -executeMethod Menchino.Editor.AndroidBuilder.Build \
-            -stackTraceLogType Full \
-            -logFile "$LOGS/unity-build-clean-online.log" || BUILD_EXIT=$?
-          echo "build_after_online_exit=$BUILD_EXIT" >> "$LOGS/activation-attempts.txt"
-
-          APK_COUNT=$(find "$PROJECT/Builds/Android" -maxdepth 1 -type f -name '*.apk' | wc -l | tr -d ' ')
-          echo "apk_count=$APK_COUNT" >> "$LOGS/activation-attempts.txt"
-          if [ "$BUILD_EXIT" -ne 0 ]; then
-            echo 'activation_mode=clean-online-active-build-failed' >> "$LOGS/activation-attempts.txt"
-            exit "$BUILD_EXIT"
-          fi
-          if [ "$APK_COUNT" -ne 2 ]; then
-            echo 'activation_mode=clean-online-build-missing-apks' >> "$LOGS/activation-attempts.txt"
-            exit 72
-          fi
-
-          echo 'activation_mode=clean-online-activation-success' >> "$LOGS/activation-attempts.txt"
-
-          RETURN_EXIT=0
-          run_unity return-ephemeral-license \
-            -batchmode -nographics -quit \
-            -returnlicense \
-            -logFile "$LOGS/unity-return-license.log" || RETURN_EXIT=$?
-          echo "return_license_exit=$RETURN_EXIT" >> "$LOGS/activation-attempts.txt"
-          exit 0
-          BASH
-          chmod +x "$CI_ROOT/run-unity-wf23.sh"
-
-          set +e
-          docker run --rm \
-            --network host \
-            --shm-size=2g \
-            --env-file "$CI_ROOT/runtime-unity.env" \
-            -e HOME=/root \
-            -e XDG_CACHE_HOME=/root/.cache \
-            -e XDG_CONFIG_HOME=/root/.config \
-            -e XDG_DATA_HOME=/root/.local/share \
-            -v "$CI_ROOT:/menchino-ci" \
-            -v "$CI_ROOT/unity-home:/root" \
-            -w /menchino-ci \
-            "$UNITY_IMAGE" \
-            bash /menchino-ci/run-unity-wf23.sh \
-            2>&1 | tee "$LOG_DIR/direct-unity-container-console.log"
-          BUILD_EXIT=${PIPESTATUS[0]}
-          set -e
-
-          sudo chown -R "$(id -u):$(id -g)" "$CI_ROOT" 2>/dev/null || true
-          echo "direct_container_exit=$BUILD_EXIT" | tee "$LOG_DIR/direct-container-outcome.txt"
-          if [ "$BUILD_EXIT" -ne 0 ]; then
-            exit "$BUILD_EXIT"
-          fi
-
-      - name: Verify APKs and create final ZIP
-        id: package
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          printf '%s\n' 'package-output' > "$LOG_DIR/current-stage.txt"
-          ARM64_APK="$PROJECT_DIR/Builds/Android/Menchino-arm64-v8a.apk"
-          UNIVERSAL_APK="$PROJECT_DIR/Builds/Android/Menchino-universal.apk"
-
-          test -s "$ARM64_APK"
-          test -s "$UNIVERSAL_APK"
-          APK_COUNT=$(find "$PROJECT_DIR/Builds/Android" -maxdepth 1 -type f -name '*.apk' | wc -l | tr -d ' ')
-          test "$APK_COUNT" -eq 2
-
-          ARM64_SHA=$(sha256sum "$ARM64_APK" | awk '{print $1}')
-          UNIVERSAL_SHA=$(sha256sum "$UNIVERSAL_APK" | awk '{print $1}')
-          if [ "$ARM64_SHA" = "$UNIVERSAL_SHA" ]; then
-            echo 'The two APK outputs are byte-identical; refusing to package duplicate files.' >&2
-            exit 61
-          fi
-
-          rm -f "$FINAL_ZIP"
-          (cd "$PROJECT_DIR/Builds/Android" && zip -q -0 "$FINAL_ZIP" \
-            Menchino-arm64-v8a.apk Menchino-universal.apk)
-
-          python3 - <<'PY'
-          import os
-          import zipfile
-          from pathlib import Path
-
-          final_zip = Path(os.environ['FINAL_ZIP'])
-          with zipfile.ZipFile(final_zip) as zf:
-              expected = ['Menchino-arm64-v8a.apk', 'Menchino-universal.apk']
-              if zf.namelist() != expected:
-                  raise SystemExit(f'Unexpected final ZIP entries: {zf.namelist()}')
-              if zf.testzip() is not None:
-                  raise SystemExit('Final ZIP integrity check failed.')
-          PY
-
-          sha256sum "$ARM64_APK" "$UNIVERSAL_APK" "$FINAL_ZIP" | tee "$LOG_DIR/output-sha256.txt"
-          unzip -t "$FINAL_ZIP" | tee "$LOG_DIR/final-zip-test.txt"
-          unzip -l "$FINAL_ZIP" | tee "$LOG_DIR/final-zip-contents.txt"
-
-      - name: Upload final ZIP directly
-        id: upload_success
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          path: /mnt/menchino-ci/package/Menchino-Android-Latest.zip
-          archive: false
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Remove local Unity image after successful packaging
-        if: ${{ success() }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          printf '%s\n' 'remove-local-unity-image' > "$LOG_DIR/current-stage.txt"
-          docker image rm -f "$UNITY_IMAGE" 2>&1 | tee "$LOG_DIR/docker-image-cleanup.txt" || true
-          docker system prune -af 2>&1 | tee -a "$LOG_DIR/docker-image-cleanup.txt" || true
-
-      - name: Delete previous Menchino artifacts and completed runs
-        id: cleanup
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_ARTIFACT_ID: ${{ steps.upload_success.outputs.artifact-id }}
-        run: |
-          set -Eeuo pipefail
-          printf '%s\n' 'cleanup-old-output' > "$LOG_DIR/current-stage.txt"
-          : > "$LOG_DIR/cleanup.txt"
-
-          gh api --paginate \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
-            > "$LOG_DIR/artifacts-before-cleanup.json"
-
-          python3 - "$CURRENT_ARTIFACT_ID" "$LOG_DIR/artifacts-before-cleanup.json" <<'PY' > "$LOG_DIR/old-artifact-ids.txt"
-          import json
-          import re
-          import sys
-          from pathlib import Path
-
-          current = str(sys.argv[1] or '')
-          data = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
-          matcher = re.compile(r'(?i)(menchino|build-error-logs|Menchino-Android-Latest)')
-          for artifact in data.get('artifacts', []):
-              artifact_id = str(artifact.get('id', ''))
-              if artifact_id != current and matcher.search(artifact.get('name', '')):
-                  print(artifact_id)
-          PY
-
-          while IFS= read -r artifact_id; do
-            [ -n "$artifact_id" ] || continue
-            echo "delete_artifact=$artifact_id" | tee -a "$LOG_DIR/cleanup.txt"
-            gh api --method DELETE \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2022-11-28' \
-              "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" >/dev/null
-          done < "$LOG_DIR/old-artifact-ids.txt"
-
-          gh api --paginate \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/$GITHUB_REPOSITORY/actions/runs?status=completed&per_page=100" \
-            > "$LOG_DIR/runs-before-cleanup.json"
-
-          python3 - "$GITHUB_RUN_ID" "$LOG_DIR/runs-before-cleanup.json" <<'PY' > "$LOG_DIR/old-run-ids.txt"
-          import json
-          import re
-          import sys
-          from pathlib import Path
-
-          current = int(sys.argv[1])
-          data = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
-          matcher = re.compile(r'(?i)(menchino|build[-_]?apk)')
-          for run in data.get('workflow_runs', []):
-              if run.get('id') == current:
-                  continue
-              if matcher.search(run.get('name', '')) or matcher.search(run.get('path', '')):
-                  print(run['id'])
-          PY
-
-          while IFS= read -r run_id; do
-            [ -n "$run_id" ] || continue
-            echo "delete_run=$run_id" | tee -a "$LOG_DIR/cleanup.txt"
-            gh api --method DELETE \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2022-11-28' \
-              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" >/dev/null
-          done < "$LOG_DIR/old-run-ids.txt"
-
-      - name: Collect sanitized WF-23 failure logs
-        if: ${{ always() && failure() }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_ARTIFACT_ID: ${{ steps.upload_success.outputs.artifact-id }}
         run: |
           set +e
-          if [ -n "${CURRENT_ARTIFACT_ID:-}" ]; then
-            gh api --method DELETE \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2022-11-28' \
-              "repos/$GITHUB_REPOSITORY/actions/artifacts/$CURRENT_ARTIFACT_ID" >/dev/null 2>&1 || true
-          fi
-
-          FAILURE_DIR="$CI_ROOT/failure-bundle"
-          FAILURE_ZIP="$CI_ROOT/menchino-build-error-logs-wf23-run-${GITHUB_RUN_NUMBER}.zip"
-          rm -rf "$FAILURE_DIR" "$FAILURE_ZIP"
-          mkdir -p "$FAILURE_DIR"
-
-          cp -a "$LOG_DIR"/. "$FAILURE_DIR"/ 2>/dev/null || true
-          cp -a "$PROJECT_DIR/Builds/Logs" "$FAILURE_DIR/project-build-logs" 2>/dev/null || true
-          cp -a "$PROJECT_DIR/Library/Logs" "$FAILURE_DIR/library-logs" 2>/dev/null || true
-          find "$PROJECT_DIR" -type f \
-            \( -name '*.log' -o -name '*build-report*.txt' -o -name '*build-report*.log' \
-               -o -name 'gradle*.txt' -o -name 'build.gradle' -o -name 'settings.gradle' \) \
-            -size -30M -print0 2>/dev/null \
-            | while IFS= read -r -d '' file; do
-                relative="${file#${PROJECT_DIR}/}"
-                target="$FAILURE_DIR/discovered-project-logs/$relative"
-                mkdir -p "$(dirname "$target")"
-                cp -a "$file" "$target" 2>/dev/null || true
-              done
-
-          docker ps -a > "$FAILURE_DIR/docker-ps.txt" 2>&1 || true
-          docker images > "$FAILURE_DIR/docker-images.txt" 2>&1 || true
-          docker system df -v > "$FAILURE_DIR/docker-system-df.txt" 2>&1 || true
-          docker info > "$FAILURE_DIR/docker-info.txt" 2>&1 || true
-          df -hT > "$FAILURE_DIR/disk-usage.txt" 2>&1 || true
-          df -ih > "$FAILURE_DIR/inode-usage.txt" 2>&1 || true
-          findmnt > "$FAILURE_DIR/mount-layout.txt" 2>&1 || true
-          journalctl -u docker.service -u containerd.service --no-pager -n 500 \
-            > "$FAILURE_DIR/docker-service-journal.txt" 2>&1 || true
-
+          LOG_DIR="$RUNNER_TEMP/menchino-wf2-failure-logs"
+          rm -rf "$LOG_DIR"
+          mkdir -p "$LOG_DIR"
           {
-            echo "workflow_number=$WORKFLOW_NUMBER"
-            echo "workflow_signature=$WORKFLOW_SIGNATURE"
-            echo "workflow=$GITHUB_WORKFLOW"
-            echo "run_id=$GITHUB_RUN_ID"
-            echo "run_number=$GITHUB_RUN_NUMBER"
-            echo "source_zip=${SOURCE_ZIP:-not-selected}"
-            echo "source_version=${SOURCE_VERSION:-unknown}"
-            echo "unity_image=$UNITY_IMAGE"
-            echo "unity_build_outcome=${{ steps.unity_build.outcome }}"
-            echo "package_outcome=${{ steps.package.outcome }}"
-            echo "cleanup_outcome=${{ steps.cleanup.outcome }}"
-            echo "failed_stage=$(cat "$LOG_DIR/current-stage.txt" 2>/dev/null || echo unknown)"
-            echo "failed_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } > "$FAILURE_DIR/failure-summary.txt"
+            echo "Workflow: Menchino WF-2"
+            echo "Run: $GITHUB_RUN_ID"
+            echo "Commit: $GITHUB_SHA"
+            echo "Branch: $GITHUB_REF_NAME"
+            echo "UTC: $(date -u +%FT%TZ)"
+            echo "Unity: $UNITY_VERSION"
+            echo "Package: $PACKAGE_NAME"
+            echo
+            echo "Repository root files:"
+            find . -maxdepth 2 -type f -printf '%p (%s bytes)\n' | sort
+            echo
+            echo "Unity project build files:"
+            find "$PROJECT_PATH/Build" -maxdepth 2 -type f -printf '%p (%s bytes)\n' 2>/dev/null | sort
+          } > "$LOG_DIR/failure-summary.txt" 2>&1
 
-          python3 - <<'PY'
-          from pathlib import Path
+          find "$PROJECT_PATH" "$RUNNER_TEMP" -type f \
+            \( -iname '*.log' -o -iname '*TestResults*.xml' -o -iname '*.txt' \) \
+            -size -50M -print0 2>/dev/null | while IFS= read -r -d '' file; do
+              safe="$(printf '%s' "$file" | sed 's#^/##; s#[/: ]#_#g')"
+              cp "$file" "$LOG_DIR/$safe" 2>/dev/null || true
+            done
 
-          root = Path('/mnt/menchino-ci/failure-bundle')
-          protected = []
-          env_file = Path('/mnt/menchino-ci/runtime-unity.env')
-          if env_file.exists():
-              for raw in env_file.read_text(encoding='utf-8', errors='replace').splitlines():
-                  if '=' in raw:
-                      protected.append(raw.split('=', 1)[1])
-          license_path = Path('/mnt/menchino-ci/project/.unity-ci/Unity_lic.ulf')
-          if license_path.exists():
-              protected.append(license_path.read_text(encoding='utf-8', errors='replace').strip())
+          grep -RInE '(^|[^A-Za-z])(error|exception|failed|failure|fatal)([^A-Za-z]|$)' "$LOG_DIR" \
+            > "$LOG_DIR/error-lines.txt" 2>/dev/null || true
+          tar -czf "$GITHUB_WORKSPACE/menchino-wf2-failure-logs-${GITHUB_RUN_ID}.tar.gz" -C "$LOG_DIR" .
 
-          for path in root.rglob('*'):
-              if not path.is_file() or path.stat().st_size > 30_000_000:
-                  continue
-              try:
-                  content = path.read_text(encoding='utf-8', errors='replace')
-              except OSError:
-                  continue
-              for value in protected:
-                  if value:
-                      content = content.replace(value, '[REDACTED]')
-              path.write_text(content, encoding='utf-8')
-          PY
-
-          rm -f "$FAILURE_DIR/runtime-unity.env" 2>/dev/null || true
-          (cd "$FAILURE_DIR" && zip -q -r "$FAILURE_ZIP" .)
-          test -s "$FAILURE_ZIP"
-          unzip -t "$FAILURE_ZIP"
-
-      - name: Upload WF-23 error-log ZIP directly
-        if: ${{ always() && failure() }}
-        uses: actions/upload-artifact@v7.0.1
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          path: /mnt/menchino-ci/menchino-build-error-logs-wf23-run-${{ github.run_number }}.zip
-          archive: false
+          name: menchino-wf2-failure-logs-${{ github.run_id }}
+          path: menchino-wf2-failure-logs-${{ github.run_id }}.tar.gz
           if-no-files-found: error
           retention-days: 7
