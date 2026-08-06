@@ -1,0 +1,958 @@
+name: Neon Pong Final APK Build WF6
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "NEON_PONG_FLUTTER_COMPLETE_*.zip"
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: neon-pong-final-apk-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_CHANNEL: stable
+  JAVA_VERSION: "17"
+  GRADLE_VERSION: "8.7"
+  MINIMUM_APP_VERSION: "1.3.1"
+  MINIMUM_BUILD_NUMBER: "7"
+  BUILD_ROOT: ${{ github.workspace }}/.ci-neon-pong
+  EXTRACT_ROOT: ${{ github.workspace }}/.ci-neon-pong/extracted
+  OUTPUT_ROOT: ${{ github.workspace }}/.ci-neon-pong/output
+  LOG_ROOT: ${{ github.workspace }}/.ci-neon-pong/logs
+
+jobs:
+  build-apk:
+    name: Build highest-version Neon Pong source ZIP to one APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Prepare clean workspace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf "$BUILD_ROOT"
+          mkdir -p "$EXTRACT_ROOT" "$OUTPUT_ROOT" "$LOG_ROOT"
+
+      - name: Select highest-version Neon Pong source ZIP
+        id: source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import zipfile
+
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          log_root = pathlib.Path(os.environ["LOG_ROOT"]).resolve()
+          build_root = pathlib.Path(os.environ["BUILD_ROOT"]).resolve()
+          minimum_version = os.environ["MINIMUM_APP_VERSION"].strip()
+          minimum_build = os.environ["MINIMUM_BUILD_NUMBER"].strip()
+
+          excluded_tokens = (
+              "handoff",
+              "apk",
+              "failure",
+              "error",
+              "diagnostic",
+              "logs",
+              "artifact",
+              "build-output",
+              "checksum",
+              "sha256",
+              "report",
+          )
+          preferred_name = re.compile(
+              r"^neon[_-]pong[_-]flutter[_-]complete(?:[_-]|$)", re.IGNORECASE
+          )
+          version_line = re.compile(
+              r"(?m)^\s*version\s*:\s*['\"]?([^\s#'\"]+)['\"]?\s*(?:#.*)?$"
+          )
+
+          def normalize_member(name):
+              normalized = name.replace("\\", "/")
+              while normalized.startswith("./"):
+                  normalized = normalized[2:]
+              member = pathlib.PurePosixPath(normalized)
+              if member.is_absolute() or ".." in member.parts:
+                  raise ValueError(f"unsafe ZIP member: {name}")
+              return member.as_posix()
+
+          def split_version(raw):
+              value = raw.strip()
+              if "+" in value:
+                  version_name, version_code = value.rsplit("+", 1)
+              else:
+                  version_name, version_code = value, "1"
+              if not version_name:
+                  raise ValueError("empty version name")
+              if not re.fullmatch(r"\d+", version_code):
+                  raise ValueError(
+                      f"Android build number must be numeric, got: {version_code}"
+                  )
+              return version_name, version_code
+
+          def version_key(value):
+              core, sep, prerelease = value.partition("-")
+              core_parts = []
+              for token in core.split("."):
+                  if token.isdigit():
+                      core_parts.append((1, int(token)))
+                  else:
+                      chunks = re.findall(r"\d+|[A-Za-z]+", token)
+                      converted = tuple(
+                          (1, int(chunk)) if chunk.isdigit() else (0, chunk.lower())
+                          for chunk in chunks
+                      )
+                      core_parts.append((0, converted))
+              while len(core_parts) < 8:
+                  core_parts.append((1, 0))
+
+              if not sep:
+                  prerelease_key = (1, ())
+              else:
+                  identifiers = []
+                  for token in prerelease.split("."):
+                      identifiers.append(
+                          (0, int(token)) if token.isdigit() else (1, token.lower())
+                      )
+                  prerelease_key = (0, tuple(identifiers))
+              return tuple(core_parts), prerelease_key
+
+          def git_commit_time(path):
+              try:
+                  value = subprocess.check_output(
+                      ["git", "log", "-1", "--format=%ct", "--", path.name],
+                      cwd=root,
+                      text=True,
+                      stderr=subprocess.DEVNULL,
+                  ).strip()
+                  return int(value) if value else 0
+              except Exception:
+                  return 0
+
+          def inspect_zip(path):
+              with zipfile.ZipFile(path) as archive:
+                  infos = archive.infolist()
+                  if len(infos) > 30000:
+                      raise ValueError("ZIP contains more than 30000 entries")
+                  if sum(info.file_size for info in infos) > 2 * 1024 * 1024 * 1024:
+                      raise ValueError("ZIP exceeds the 2 GiB inspection limit")
+
+                  corrupt = archive.testzip()
+                  if corrupt:
+                      raise ValueError(f"corrupt entry: {corrupt}")
+
+                  members = {}
+                  for info in infos:
+                      normalized = normalize_member(info.filename)
+                      if normalized and not info.is_dir():
+                          members[normalized] = info
+
+                  projects = []
+                  for member_name, info in members.items():
+                      if not member_name.endswith("pubspec.yaml"):
+                          continue
+
+                      pubspec_path = pathlib.PurePosixPath(member_name)
+                      root_path = pubspec_path.parent
+                      if any(
+                          part in {".dart_tool", ".git", "build", "example", "vendor"}
+                          for part in root_path.parts
+                      ):
+                          continue
+
+                      main_path = (
+                          root_path / "lib" / "main.dart"
+                          if root_path.as_posix() != "."
+                          else pathlib.PurePosixPath("lib/main.dart")
+                      ).as_posix()
+                      if main_path not in members:
+                          continue
+
+                      text = archive.read(info).decode("utf-8", errors="replace")
+                      if "flutter:" not in text or "sdk: flutter" not in text:
+                          continue
+
+                      match = version_line.search(text)
+                      if not match:
+                          raise ValueError(
+                              f"Flutter project {root_path.as_posix()} has no valid version line"
+                          )
+                      version_name, version_code = split_version(match.group(1))
+                      project_root = root_path.as_posix()
+                      if project_root in ("", "."):
+                          project_root = "."
+                      depth = 0 if project_root == "." else len(root_path.parts)
+                      projects.append(
+                          {
+                              "root": project_root,
+                              "depth": depth,
+                              "version_name": version_name,
+                              "version_code": version_code,
+                          }
+                      )
+
+                  if not projects:
+                      raise ValueError(
+                          "no complete Flutter app with pubspec.yaml and lib/main.dart"
+                      )
+
+                  minimum_depth = min(project["depth"] for project in projects)
+                  shallow_projects = [
+                      project for project in projects if project["depth"] == minimum_depth
+                  ]
+                  return max(
+                      shallow_projects,
+                      key=lambda project: (
+                          version_key(project["version_name"]),
+                          int(project["version_code"]),
+                          project["root"].lower(),
+                      ),
+                  )
+
+          accepted = []
+          rejected = []
+          for path in sorted(root.glob("*.zip"), key=lambda item: item.name.lower()):
+              lower_name = path.name.lower()
+              matching_token = next(
+                  (token for token in excluded_tokens if token in lower_name), None
+              )
+              if matching_token:
+                  rejected.append((path.name, f"ignored filename token: {matching_token}"))
+                  continue
+
+              try:
+                  project = inspect_zip(path)
+              except Exception as error:
+                  rejected.append((path.name, str(error)))
+                  continue
+
+              accepted.append(
+                  {
+                      "path": path.resolve(),
+                      "name": path.name,
+                      "preferred": bool(preferred_name.search(lower_name)),
+                      "commit_time": git_commit_time(path),
+                      "mtime": path.stat().st_mtime_ns,
+                      **project,
+                  }
+              )
+
+          if not accepted:
+              report = ["No valid source ZIP was found."]
+              report.extend(f"REJECTED | {name} | {reason}" for name, reason in rejected)
+              (log_root / "source-selection.txt").write_text(
+                  "\n".join(report) + "\n", encoding="utf-8"
+              )
+              raise SystemExit(
+                  "No valid Flutter source ZIP was found in the repository root. "
+                  "Upload NEON_PONG_FLUTTER_COMPLETE_*.zip."
+              )
+
+          preferred = [candidate for candidate in accepted if candidate["preferred"]]
+          pool = preferred if preferred else accepted
+          selected = max(
+              pool,
+              key=lambda candidate: (
+                  version_key(candidate["version_name"]),
+                  int(candidate["version_code"]),
+                  candidate["commit_time"],
+                  candidate["mtime"],
+                  candidate["name"].lower(),
+              ),
+          )
+
+          selected_version_key = version_key(selected["version_name"])
+          required_version_key = version_key(minimum_version)
+          is_too_old = selected_version_key < required_version_key
+          if selected_version_key == required_version_key:
+              is_too_old = int(selected["version_code"]) < int(minimum_build)
+
+          report = [
+              "Selection policy: preferred NEON_PONG_FLUTTER_COMPLETE_* files first; "
+              "highest pubspec version wins.",
+              f"Required minimum: {minimum_version}+{minimum_build}",
+              "",
+              "VALID CANDIDATES:",
+          ]
+          for candidate in sorted(
+              accepted,
+              key=lambda item: (
+                  item["preferred"],
+                  version_key(item["version_name"]),
+                  int(item["version_code"]),
+                  item["commit_time"],
+              ),
+              reverse=True,
+          ):
+              report.append(
+                  "ACCEPTED | "
+                  f"{candidate['name']} | "
+                  f"version={candidate['version_name']}+{candidate['version_code']} | "
+                  f"project={candidate['root']} | "
+                  f"preferred={candidate['preferred']} | "
+                  f"commit={candidate['commit_time']}"
+              )
+          if rejected:
+              report.extend(("", "IGNORED OR INVALID:"))
+              report.extend(f"REJECTED | {name} | {reason}" for name, reason in rejected)
+          report.extend(
+              (
+                  "",
+                  "SELECTED | "
+                  f"{selected['name']} | "
+                  f"version={selected['version_name']}+{selected['version_code']} | "
+                  f"project={selected['root']}",
+              )
+          )
+          (log_root / "source-selection.txt").write_text(
+              "\n".join(report) + "\n", encoding="utf-8"
+          )
+
+          print("\n".join(report))
+          if is_too_old:
+              raise SystemExit(
+                  "Selected source is older than the required target: "
+                  f"selected={selected['version_name']}+{selected['version_code']}, "
+                  f"required={minimum_version}+{minimum_build}."
+              )
+
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              output.write(f"zip_path={selected['path']}\n")
+              output.write(f"zip_name={selected['name']}\n")
+              output.write(f"project_root={selected['root']}\n")
+              output.write(f"version_name={selected['version_name']}\n")
+              output.write(f"version_code={selected['version_code']}\n")
+              output.write(
+                  f"detected_version={selected['version_name']}+{selected['version_code']}\n"
+              )
+
+          (build_root / "source-zip.txt").write_text(
+              str(selected["path"]), encoding="utf-8"
+          )
+          (build_root / "source-name.txt").write_text(
+              selected["name"], encoding="utf-8"
+          )
+          (build_root / "source-project-root.txt").write_text(
+              selected["root"], encoding="utf-8"
+          )
+          (build_root / "source-version.txt").write_text(
+              f"{selected['version_name']}+{selected['version_code']}",
+              encoding="utf-8",
+          )
+          PY
+
+          SOURCE_ZIP="$(cat "$BUILD_ROOT/source-zip.txt")"
+          SOURCE_ZIP_NAME="$(cat "$BUILD_ROOT/source-name.txt")"
+          SOURCE_PROJECT_ROOT="$(cat "$BUILD_ROOT/source-project-root.txt")"
+          DETECTED_VERSION="$(cat "$BUILD_ROOT/source-version.txt")"
+          test -s "$SOURCE_ZIP"
+          sha256sum "$SOURCE_ZIP" | tee "$LOG_ROOT/source-zip.sha256"
+
+          {
+            echo "## Source selected by version"
+            echo
+            echo "- ZIP: \`$SOURCE_ZIP_NAME\`"
+            echo "- Flutter project inside ZIP: \`$SOURCE_PROJECT_ROOT\`"
+            echo "- Detected pubspec version: \`$DETECTED_VERSION\`"
+            echo "- Required minimum: \`$MINIMUM_APP_VERSION+$MINIMUM_BUILD_NUMBER\`"
+            echo "- Policy: preferred Neon Pong source filename, then highest semantic version"
+            echo
+            echo "<details><summary>Candidate inspection</summary>"
+            echo
+            echo '```text'
+            cat "$LOG_ROOT/source-selection.txt"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate and securely extract source ZIP
+        id: project
+        shell: bash
+        env:
+          SOURCE_ZIP: ${{ steps.source.outputs.zip_path }}
+          SOURCE_PROJECT_ROOT: ${{ steps.source.outputs.project_root }}
+          EXPECTED_VERSION_NAME: ${{ steps.source.outputs.version_name }}
+          EXPECTED_VERSION_CODE: ${{ steps.source.outputs.version_code }}
+        run: |
+          set -Eeuo pipefail
+
+          python3 <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import stat
+          import zipfile
+
+          source_zip = pathlib.Path(os.environ["SOURCE_ZIP"]).resolve()
+          extract_root = pathlib.Path(os.environ["EXTRACT_ROOT"]).resolve()
+          extract_root.mkdir(parents=True, exist_ok=True)
+
+          max_entries = 30000
+          max_uncompressed_size = 2 * 1024 * 1024 * 1024
+          entry_count = 0
+          total_size = 0
+
+          with zipfile.ZipFile(source_zip) as archive:
+              corrupt_entry = archive.testzip()
+              if corrupt_entry:
+                  raise SystemExit(f"Corrupt ZIP entry: {corrupt_entry}")
+
+              for info in archive.infolist():
+                  entry_count += 1
+                  total_size += info.file_size
+
+                  if entry_count > max_entries:
+                      raise SystemExit("Source ZIP contains too many entries.")
+                  if total_size > max_uncompressed_size:
+                      raise SystemExit("Source ZIP exceeds the 2 GiB extraction limit.")
+
+                  normalized = info.filename.replace("\\", "/")
+                  member = pathlib.PurePosixPath(normalized)
+
+                  if member.is_absolute() or ".." in member.parts:
+                      raise SystemExit(f"Unsafe ZIP path: {info.filename}")
+
+                  unix_mode = info.external_attr >> 16
+                  if stat.S_ISLNK(unix_mode):
+                      raise SystemExit(f"Symbolic links are not accepted: {info.filename}")
+
+                  destination = (
+                      extract_root / pathlib.Path(*member.parts)
+                  ).resolve()
+                  if destination != extract_root and extract_root not in destination.parents:
+                      raise SystemExit(f"ZIP entry escaped extraction root: {info.filename}")
+
+                  if info.is_dir():
+                      destination.mkdir(parents=True, exist_ok=True)
+                      continue
+
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  with archive.open(info) as source, destination.open("wb") as target:
+                      shutil.copyfileobj(source, target)
+
+          requested_root = os.environ["SOURCE_PROJECT_ROOT"].strip()
+          if requested_root in ("", "."):
+              project_dir = extract_root
+          else:
+              requested = pathlib.PurePosixPath(requested_root.replace("\\", "/"))
+              if requested.is_absolute() or ".." in requested.parts:
+                  raise SystemExit(
+                      f"Unsafe selected project root: {requested_root}"
+                  )
+              project_dir = (
+                  extract_root / pathlib.Path(*requested.parts)
+              ).resolve()
+
+          if project_dir != extract_root and extract_root not in project_dir.parents:
+              raise SystemExit("Selected project root escaped extraction directory.")
+
+          pubspec = project_dir / "pubspec.yaml"
+          main_dart = project_dir / "lib" / "main.dart"
+          if not pubspec.is_file() or not main_dart.is_file():
+              raise SystemExit(
+                  "The project selected during ZIP inspection was not found after extraction."
+              )
+
+          text = pubspec.read_text(encoding="utf-8", errors="replace")
+          if "flutter:" not in text or "sdk: flutter" not in text:
+              raise SystemExit("Selected pubspec.yaml is not a Flutter application.")
+
+          version_match = __import__("re").search(
+              r"(?m)^\s*version\s*:\s*['\"]?([^\s#'\"]+)['\"]?\s*(?:#.*)?$",
+              text,
+          )
+          if not version_match:
+              raise SystemExit("Selected pubspec.yaml has no valid version line.")
+          raw_version = version_match.group(1)
+          if "+" in raw_version:
+              actual_name, actual_code = raw_version.rsplit("+", 1)
+          else:
+              actual_name, actual_code = raw_version, "1"
+
+          expected_name = os.environ["EXPECTED_VERSION_NAME"]
+          expected_code = os.environ["EXPECTED_VERSION_CODE"]
+          if (actual_name, actual_code) != (expected_name, expected_code):
+              raise SystemExit(
+                  "Version changed between ZIP inspection and extraction: "
+                  f"expected={expected_name}+{expected_code}, "
+                  f"actual={actual_name}+{actual_code}."
+              )
+
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              output.write(f"project_dir={project_dir}\n")
+
+          (pathlib.Path(os.environ["BUILD_ROOT"]) / "project-dir.txt").write_text(
+              str(project_dir), encoding="utf-8"
+          )
+
+          print(f"Flutter project: {project_dir}")
+          print(f"ZIP entries: {entry_count}")
+          print(f"Uncompressed size: {total_size} bytes")
+          PY
+
+          PROJECT_DIR="$(cat "$BUILD_ROOT/project-dir.txt")"
+          test -f "$PROJECT_DIR/pubspec.yaml"
+          test -f "$PROJECT_DIR/lib/main.dart"
+
+          {
+            echo "Source ZIP: $SOURCE_ZIP"
+            echo "Project directory: $PROJECT_DIR"
+          } | tee "$LOG_ROOT/extraction.txt"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: Set up Gradle fallback
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-read-only: false
+
+      - name: Record environment versions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "=== Flutter ==="
+            flutter --version
+            echo
+            echo "=== Dart ==="
+            dart --version 2>&1
+            echo
+            echo "=== Java ==="
+            java -version 2>&1
+            echo
+            echo "=== Gradle fallback ==="
+            gradle --version
+          } | tee "$LOG_ROOT/tool-versions.txt"
+
+      - name: Prepare Android project and Gradle wrapper
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! -d android ]]; then
+            echo "Android platform is missing. Regenerating it with Flutter."
+            flutter create --platforms=android . \
+              2>&1 | tee "$LOG_ROOT/flutter-create-android.log"
+          fi
+
+          FLUTTER_SDK="$(cd "$(dirname "$(command -v flutter)")/.." && pwd)"
+          ANDROID_SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+
+          if [[ -z "$ANDROID_SDK" ]]; then
+            echo "Android SDK path was not provided by the runner." >&2
+            exit 1
+          fi
+
+          cat > android/local.properties <<EOF
+          sdk.dir=$ANDROID_SDK
+          flutter.sdk=$FLUTTER_SDK
+          EOF
+
+          chmod +x android/gradlew 2>/dev/null || true
+
+          if [[ ! -f android/gradle/wrapper/gradle-wrapper.jar ]]; then
+            echo "Gradle wrapper JAR is missing; regenerating it."
+            (
+              cd android
+              gradle wrapper \
+                --gradle-version "$GRADLE_VERSION" \
+                --distribution-type bin \
+                --no-daemon \
+                --stacktrace
+            ) 2>&1 | tee "$LOG_ROOT/gradle-wrapper-repair.log"
+          fi
+
+          test -f android/gradle/wrapper/gradle-wrapper.jar
+          test -f android/gradle/wrapper/gradle-wrapper.properties
+          test -x android/gradlew
+
+      - name: Resolve Flutter dependencies
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: |
+          set -Eeuo pipefail
+          flutter pub get 2>&1 | tee "$LOG_ROOT/flutter-pub-get.log"
+
+      - name: Analyze Dart source
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: |
+          set -Eeuo pipefail
+          flutter analyze --no-fatal-infos --no-fatal-warnings \
+            2>&1 | tee "$LOG_ROOT/flutter-analyze.log"
+
+      - name: Run Flutter tests when present
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: |
+          set -Eeuo pipefail
+
+          if find test -type f -name '*_test.dart' -print -quit 2>/dev/null | grep -q .; then
+            flutter test --reporter expanded \
+              2>&1 | tee "$LOG_ROOT/flutter-test.log"
+          else
+            echo "No Flutter tests were found." | tee "$LOG_ROOT/flutter-test.log"
+          fi
+
+      - name: Verify and export application version
+        id: version
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        env:
+          EXPECTED_VERSION_NAME: ${{ steps.source.outputs.version_name }}
+          EXPECTED_VERSION_CODE: ${{ steps.source.outputs.version_code }}
+        run: |
+          set -Eeuo pipefail
+
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+
+          text = pathlib.Path("pubspec.yaml").read_text(
+              encoding="utf-8", errors="replace"
+          )
+          match = re.search(
+              r"(?m)^\s*version\s*:\s*['\"]?([^\s#'\"]+)['\"]?\s*(?:#.*)?$",
+              text,
+          )
+          if not match:
+              raise SystemExit("pubspec.yaml has no valid version line.")
+
+          raw_version = match.group(1)
+          if "+" in raw_version:
+              version_name, version_code = raw_version.rsplit("+", 1)
+          else:
+              version_name, version_code = raw_version, "1"
+
+          if not re.fullmatch(r"\d+", version_code):
+              raise SystemExit(
+                  f"Android build number must be numeric, got: {version_code}"
+              )
+
+          expected_name = os.environ["EXPECTED_VERSION_NAME"]
+          expected_code = os.environ["EXPECTED_VERSION_CODE"]
+          if (version_name, version_code) != (expected_name, expected_code):
+              raise SystemExit(
+                  "Extracted application version does not match selected source: "
+                  f"expected={expected_name}+{expected_code}, "
+                  f"actual={version_name}+{version_code}."
+              )
+
+          safe_name = re.sub(r"[^0-9A-Za-z._-]+", "-", version_name)
+          safe_code = re.sub(r"[^0-9A-Za-z._-]+", "-", version_code)
+
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              output.write(f"name={version_name}\n")
+              output.write(f"code={version_code}\n")
+              output.write(f"safe_name={safe_name}\n")
+              output.write(f"safe_code={safe_code}\n")
+
+          print(f"Verified version: {version_name}+{version_code}")
+          PY
+
+      - name: Clean previous local build files
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: |
+          set -Eeuo pipefail
+          flutter clean 2>&1 | tee "$LOG_ROOT/flutter-clean.log"
+          flutter pub get 2>&1 | tee "$LOG_ROOT/flutter-pub-get-after-clean.log"
+
+      - name: Build one release APK
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: |
+          set -Eeuo pipefail
+          flutter build apk \
+            --release \
+            --build-name "${{ steps.version.outputs.name }}" \
+            --build-number "${{ steps.version.outputs.code }}" \
+            2>&1 | tee "$LOG_ROOT/flutter-build-apk.log"
+
+      - name: Verify exactly one APK and prepare final output
+        id: apk
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
+          SOURCE_ZIP_NAME: ${{ steps.source.outputs.zip_name }}
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          SAFE_VERSION: ${{ steps.version.outputs.safe_name }}
+          SAFE_CODE: ${{ steps.version.outputs.safe_code }}
+        run: |
+          set -Eeuo pipefail
+
+          rm -rf "$OUTPUT_ROOT"
+          mkdir -p "$OUTPUT_ROOT"
+
+          CANONICAL_APK="$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk"
+
+          if [[ -s "$CANONICAL_APK" ]]; then
+            APK_SOURCE="$CANONICAL_APK"
+          else
+            mapfile -t APK_FILES < <(
+              find "$PROJECT_DIR/build/app/outputs/flutter-apk" \
+                -maxdepth 1 \
+                -type f \
+                -name '*release*.apk' \
+                ! -name '*debug*.apk' \
+                ! -name '*profile*.apk' \
+                -print 2>/dev/null \
+                | sort -u
+            )
+
+            if [[ "${#APK_FILES[@]}" -ne 1 ]]; then
+              echo "Expected exactly one Flutter release APK, found ${#APK_FILES[@]}." >&2
+              printf 'Detected APK: %s\n' "${APK_FILES[@]:-none}" >&2
+              exit 1
+            fi
+
+            APK_SOURCE="${APK_FILES[0]}"
+          fi
+
+          test -s "$APK_SOURCE"
+
+          APK_NAME="Neon-Pong-v${SAFE_VERSION}-build${SAFE_CODE}.apk"
+          APK_FINAL="$OUTPUT_ROOT/$APK_NAME"
+          cp "$APK_SOURCE" "$APK_FINAL"
+
+          test -s "$APK_FINAL"
+          unzip -t "$APK_FINAL" | tee "$LOG_ROOT/apk-integrity.log"
+
+          FILE_COUNT="$(find "$OUTPUT_ROOT" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [[ "$FILE_COUNT" != "1" ]]; then
+            echo "Output directory must contain exactly one file; found $FILE_COUNT." >&2
+            find "$OUTPUT_ROOT" -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+
+          APK_SHA256="$(sha256sum "$APK_FINAL" | awk '{print $1}')"
+          APK_SIZE="$(stat -c '%s' "$APK_FINAL")"
+
+          echo "apk_path=$APK_FINAL" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
+          echo "apk_sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=NEON-PONG-APK-v${SAFE_VERSION}-build${SAFE_CODE}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## APK build completed"
+            echo
+            echo "- Source ZIP: \`$SOURCE_ZIP_NAME\`"
+            echo "- App version: \`$VERSION_NAME+$VERSION_CODE\`"
+            echo "- Output: \`$APK_NAME\`"
+            echo "- Size: \`$APK_SIZE bytes\`"
+            echo "- SHA-256: \`$APK_SHA256\`"
+            echo "- Output file count: \`1\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the current APK only
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.apk.outputs.artifact_name }}
+          path: ${{ steps.apk.outputs.apk_path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+      - name: Delete every older Actions artifact
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "$CURRENT_ARTIFACT_ID" ]]; then
+            echo "Current artifact ID is empty; refusing cleanup." >&2
+            exit 1
+          fi
+
+          echo "Keeping current artifact ID: $CURRENT_ARTIFACT_ID"
+          deleted=0
+
+          while IFS=$'\t' read -r artifact_id artifact_name run_id; do
+            [[ -n "$artifact_id" ]] || continue
+
+            if [[ "$artifact_id" == "$CURRENT_ARTIFACT_ID" ]]; then
+              echo "Keep current artifact: $artifact_name (ID: $artifact_id)"
+              continue
+            fi
+
+            echo "Delete old artifact: $artifact_name (ID: $artifact_id, run: $run_id)"
+            gh api \
+              --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
+            deleted=$((deleted + 1))
+          done < <(
+            gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+              --jq '.artifacts[] | [(.id|tostring), .name, ((.workflow_run.id // 0)|tostring)] | @tsv'
+          )
+
+          remaining_old="$(
+            gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+              --jq "[.artifacts[] | select((.id|tostring) != \"$CURRENT_ARTIFACT_ID\")] | length" \
+              | awk '{sum += $1} END {print sum + 0}'
+          )"
+
+          if [[ "$remaining_old" != "0" ]]; then
+            echo "Old artifacts still remain after cleanup: $remaining_old" >&2
+            exit 1
+          fi
+
+          {
+            echo
+            echo "## Output cleanup"
+            echo
+            echo "- Deleted old artifacts: \`$deleted\`"
+            echo "- Remaining successful output: current APK artifact only"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect complete failure diagnostics
+        if: failure()
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
+          SOURCE_ZIP_NAME: ${{ steps.source.outputs.zip_name }}
+        run: |
+          set +e
+
+          DIAG_DIR="$BUILD_ROOT/failure-diagnostics"
+          DIAG_ZIP="$BUILD_ROOT/NEON-PONG-BUILD-ERROR-run${GITHUB_RUN_NUMBER}.zip"
+          rm -rf "$DIAG_DIR" "$DIAG_ZIP"
+          mkdir -p "$DIAG_DIR/logs"
+
+          cp -a "$LOG_ROOT/." "$DIAG_DIR/logs/" 2>/dev/null || true
+
+          {
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Branch/ref: $GITHUB_REF"
+            echo "Commit: $GITHUB_SHA"
+            echo "Workflow: $GITHUB_WORKFLOW"
+            echo "Run ID: $GITHUB_RUN_ID"
+            echo "Run number: $GITHUB_RUN_NUMBER"
+            echo "Run attempt: $GITHUB_RUN_ATTEMPT"
+            echo "Source ZIP: ${SOURCE_ZIP_NAME:-not-selected}"
+            echo "Project directory: ${PROJECT_DIR:-not-detected}"
+            echo "Runner OS: $RUNNER_OS"
+            echo "UTC: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          } > "$DIAG_DIR/RUN-INFO.txt"
+
+          {
+            echo "=== Flutter doctor ==="
+            flutter doctor -v 2>&1 || true
+            echo
+            echo "=== Flutter version ==="
+            flutter --version 2>&1 || true
+            echo
+            echo "=== Java version ==="
+            java -version 2>&1 || true
+            echo
+            echo "=== Disk usage ==="
+            df -h 2>&1 || true
+            echo
+            echo "=== Memory ==="
+            free -h 2>&1 || true
+          } > "$DIAG_DIR/ENVIRONMENT.txt"
+
+          if [[ -n "${PROJECT_DIR:-}" && -d "$PROJECT_DIR" ]]; then
+            cp "$PROJECT_DIR/pubspec.yaml" "$DIAG_DIR/pubspec.yaml" 2>/dev/null || true
+            cp "$PROJECT_DIR/pubspec.lock" "$DIAG_DIR/pubspec.lock" 2>/dev/null || true
+            cp "$PROJECT_DIR/analysis_options.yaml" "$DIAG_DIR/analysis_options.yaml" 2>/dev/null || true
+            cp "$PROJECT_DIR/android/settings.gradle" "$DIAG_DIR/settings.gradle" 2>/dev/null || true
+            cp "$PROJECT_DIR/android/settings.gradle.kts" "$DIAG_DIR/settings.gradle.kts" 2>/dev/null || true
+            cp "$PROJECT_DIR/android/build.gradle" "$DIAG_DIR/android-build.gradle" 2>/dev/null || true
+            cp "$PROJECT_DIR/android/build.gradle.kts" "$DIAG_DIR/android-build.gradle.kts" 2>/dev/null || true
+            cp "$PROJECT_DIR/android/app/build.gradle" "$DIAG_DIR/app-build.gradle" 2>/dev/null || true
+            cp "$PROJECT_DIR/android/app/build.gradle.kts" "$DIAG_DIR/app-build.gradle.kts" 2>/dev/null || true
+            cp "$PROJECT_DIR/android/gradle/wrapper/gradle-wrapper.properties" \
+              "$DIAG_DIR/gradle-wrapper.properties" 2>/dev/null || true
+
+            find "$PROJECT_DIR" \
+              -maxdepth 9 \
+              -type f \
+              \( \
+                -name '*.log' \
+                -o -name 'hs_err_pid*.log' \
+                -o -name '*.txt' \
+                -o -name 'lint-results*.xml' \
+              \) \
+              -print > "$DIAG_DIR/LOCATED-LOG-FILES.txt" 2>/dev/null || true
+
+            while IFS= read -r file; do
+              [[ -f "$file" ]] || continue
+              relative="${file#$PROJECT_DIR/}"
+              safe_name="$(printf '%s' "$relative" | tr '/ ' '__')"
+              cp "$file" "$DIAG_DIR/$safe_name" 2>/dev/null || true
+            done < "$DIAG_DIR/LOCATED-LOG-FILES.txt"
+
+            (
+              cd "$PROJECT_DIR/android" 2>/dev/null || exit 0
+              ./gradlew --version --no-daemon 2>&1 || true
+            ) > "$DIAG_DIR/GRADLE-VERSION.txt"
+          fi
+
+          find "$DIAG_DIR" -type f -empty -delete 2>/dev/null || true
+
+          (
+            cd "$DIAG_DIR"
+            zip -9 -r "$DIAG_ZIP" .
+          )
+
+          test -s "$DIAG_ZIP" || true
+
+      - name: Upload error logs when build fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: NEON-PONG-BUILD-ERROR-run${{ github.run_number }}-attempt${{ github.run_attempt }}
+          path: ${{ env.BUILD_ROOT }}/NEON-PONG-BUILD-ERROR-run${{ github.run_number }}.zip
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 14
