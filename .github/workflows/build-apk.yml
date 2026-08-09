@@ -1,0 +1,592 @@
+name: ZARBU • Final Build • Offline + Stores
+run-name: ZARBU Final APKs • ${{ github.event_name }} • ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_zip:
+        description: "نام یا مسیر ZIP سورس؛ خالی = جدیدترین ZIP ریپو"
+        required: false
+        type: string
+  push:
+    paths:
+      - "**/*.zip"
+      - ".github/workflows/**"
+
+# Push جدید اجرای فعال را متوقف نمی‌کند؛ اجرای بعدی در صف امن می‌ماند.
+concurrency:
+  group: zarbu-latest-zip-apk-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  APP_NAME: ZARBU
+  APK_FILE_NAME: ZARBU-offline-release.apk
+  ARTIFACT_NAME: ZARBU-FINAL-APKS
+  ERROR_ARTIFACT_NAME: ZARBU-build-error-run-${{ github.run_number }}-attempt-${{ github.run_attempt }}-id-${{ github.run_id }}
+  FLUTTER_VERSION: "3.44.9"
+  JAVA_VERSION: "21"
+
+jobs:
+  build-apk:
+    name: Build final release APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Initialize build workspace
+        id: init
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BUILD_ROOT="${RUNNER_TEMP}/zarbu-build"
+          LOG_DIR="${BUILD_ROOT}/logs"
+          SOURCE_DIR="${BUILD_ROOT}/source"
+          PROJECT_DIR="${BUILD_ROOT}/project"
+          OUTPUT_DIR="${BUILD_ROOT}/output"
+          DIAG_DIR="${BUILD_ROOT}/diagnostics"
+
+          rm -rf "$BUILD_ROOT"
+          mkdir -p "$LOG_DIR" "$SOURCE_DIR" "$OUTPUT_DIR" "$DIAG_DIR"
+
+          {
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "started_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > "$LOG_DIR/run-info.txt"
+
+          {
+            echo "BUILD_ROOT=$BUILD_ROOT"
+            echo "LOG_DIR=$LOG_DIR"
+            echo "SOURCE_DIR=$SOURCE_DIR"
+            echo "PROJECT_DIR=$PROJECT_DIR"
+            echo "OUTPUT_DIR=$OUTPUT_DIR"
+            echo "DIAG_DIR=$DIAG_DIR"
+          } >> "$GITHUB_ENV"
+
+      - name: Select and validate latest source ZIP
+        id: source
+        shell: bash
+        env:
+          REQUESTED_ZIP: ${{ github.event.inputs.source_zip || '' }}
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$LOG_DIR/01-source-selection.log") 2>&1
+
+          requested="${REQUESTED_ZIP#./}"
+          selected=""
+
+          if [[ -n "$requested" ]]; then
+            if [[ ! -f "$requested" ]]; then
+              echo "ERROR: Requested ZIP does not exist: $requested" >&2
+              exit 20
+            fi
+            selected="$requested"
+          else
+            mapfile -d '' candidates < <(
+              find . -type f -iname '*.zip' \
+                -not -path './.git/*' \
+                -not -path './build/*' \
+                -not -path './outputs/*' \
+                -not -path './artifacts/*' \
+                -not -path './diagnostics/*' \
+                -not -iname '*diagnostic*.zip' \
+                -not -iname '*failure*.zip' \
+                -not -iname '*error-log*.zip' \
+                -not -iname '*build-log*.zip' \
+                -print0
+            )
+
+            if (( ${#candidates[@]} == 0 )); then
+              echo "ERROR: No source ZIP was found in the repository." >&2
+              exit 21
+            fi
+
+            best_score=-1
+            for file in "${candidates[@]}"; do
+              if ! unzip -Z1 "$file" | grep -Eq '(^|/)pubspec\.yaml$'; then
+                echo "skip non-source ZIP: ${file#./}"
+                continue
+              fi
+              rel="${file#./}"
+              commit_time="$(git log -1 --format=%ct -- "$rel" 2>/dev/null || true)"
+              if [[ ! "$commit_time" =~ ^[0-9]+$ ]]; then
+                commit_time="$(stat -c %Y "$file")"
+              fi
+              size="$(stat -c %s "$file")"
+              score=$((commit_time * 1000000000 + (size > 999999999 ? 999999999 : size)))
+              printf 'candidate: %s | commit_time=%s | bytes=%s\n' "$rel" "$commit_time" "$size"
+              if (( score > best_score )); then
+                best_score=$score
+                selected="$rel"
+              fi
+            done
+          fi
+
+          if [[ -z "$selected" ]]; then
+            echo "ERROR: ZIP files exist, but none contains a Flutter pubspec.yaml." >&2
+            exit 21
+          fi
+          test -s "$selected"
+          unzip -tq "$selected"
+
+          selected_abs="$(realpath "$selected")"
+          workspace_abs="$(realpath "$GITHUB_WORKSPACE")"
+          case "$selected_abs" in
+            "$workspace_abs"/*) ;;
+            *) echo "ERROR: ZIP must be inside the repository workspace." >&2; exit 22 ;;
+          esac
+
+          echo "Selected source ZIP: $selected"
+          sha256sum "$selected" | tee "$LOG_DIR/source-zip.sha256"
+          unzip -l "$selected" > "$LOG_DIR/source-zip-contents.txt"
+
+          echo "SOURCE_ZIP=$selected_abs" >> "$GITHUB_ENV"
+          echo "source_zip=$selected" >> "$GITHUB_OUTPUT"
+          echo "### Source ZIP" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Selected: \`$selected\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SHA-256: \`$(sha256sum "$selected" | awk '{print $1}')\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Extract ZIP and detect Flutter project
+        id: detect
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$LOG_DIR/02-project-detection.log") 2>&1
+
+          rm -rf "$SOURCE_DIR" "$PROJECT_DIR"
+          mkdir -p "$SOURCE_DIR"
+          unzip -q "$SOURCE_ZIP" -d "$SOURCE_DIR"
+
+          mapfile -t pubspecs < <(
+            find "$SOURCE_DIR" -type f -name pubspec.yaml \
+              -not -path '*/.dart_tool/*' \
+              -not -path '*/build/*' \
+              -not -path '*/example/build/*' \
+              -print
+          )
+
+          if (( ${#pubspecs[@]} == 0 )); then
+            echo "ERROR: pubspec.yaml was not found inside the selected ZIP." >&2
+            exit 30
+          fi
+
+          project_pubspec=""
+          best_depth=9999
+          for pubspec in "${pubspecs[@]}"; do
+            dir="$(dirname "$pubspec")"
+            [[ -f "$dir/lib/main.dart" ]] || continue
+            depth="$(awk -F/ '{print NF}' <<< "${dir#$SOURCE_DIR/}")"
+            project_name="$(awk -F: '/^[[:space:]]*name:[[:space:]]*/ {print $2; exit}' "$pubspec" | tr -d '[:space:]\"')"
+            score_depth=$depth
+            [[ "$project_name" == "zarbu" ]] && score_depth=$((depth - 100))
+            printf 'project candidate: %s | name=%s | score=%s\n' "$dir" "$project_name" "$score_depth"
+            if (( score_depth < best_depth )); then
+              best_depth=$score_depth
+              project_pubspec="$pubspec"
+            fi
+          done
+
+          if [[ -z "$project_pubspec" ]]; then
+            echo "ERROR: No Flutter application containing lib/main.dart was found." >&2
+            exit 31
+          fi
+
+          detected_root="$(dirname "$project_pubspec")"
+          mkdir -p "$PROJECT_DIR"
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.dart_tool/' \
+            --exclude='build/' \
+            --exclude='outputs/' \
+            "$detected_root/" "$PROJECT_DIR/"
+
+          echo "Detected Flutter root: ${detected_root#$SOURCE_DIR/}"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "project_root=${detected_root#$SOURCE_DIR/}" >> "$GITHUB_OUTPUT"
+          find "$PROJECT_DIR" -maxdepth 3 -type f | sort > "$LOG_DIR/detected-project-files.txt"
+
+      - name: Run ZARBU release gate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$LOG_DIR/02b-release-gate.log") 2>&1
+          cd "$PROJECT_DIR"
+          python3 tool/release_gate.py "$PROJECT_DIR"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Prepare Android project safely
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$LOG_DIR/03-prepare-project.log") 2>&1
+
+          flutter config --no-analytics
+          flutter --version
+          java -version
+
+          if [[ ! -f "$PROJECT_DIR/android/gradlew" ]] || \
+             [[ ! -d "$PROJECT_DIR/android/app" ]] || \
+             [[ ! -f "$PROJECT_DIR/android/settings.gradle" && ! -f "$PROJECT_DIR/android/settings.gradle.kts" ]]; then
+            echo "Android platform is missing or incomplete; generating it with the installed Flutter SDK."
+            TEMPLATE_DIR="$BUILD_ROOT/flutter-template"
+            rm -rf "$TEMPLATE_DIR"
+            flutter create \
+              --platforms=android \
+              --org=mk.kadkhodai \
+              --project-name=zarbu \
+              "$TEMPLATE_DIR"
+            rm -rf "$PROJECT_DIR/android"
+            cp -R "$TEMPLATE_DIR/android" "$PROJECT_DIR/android"
+            cp "$TEMPLATE_DIR/.metadata" "$PROJECT_DIR/.metadata"
+          else
+            echo "Existing Android platform detected and preserved."
+          fi
+
+          rm -f "$PROJECT_DIR/android/local.properties"
+          if [[ -f "$PROJECT_DIR/android/gradle.properties" ]]; then
+            sed -i '/^[[:space:]]*org\.gradle\.java\.home[[:space:]]*=/d' "$PROJECT_DIR/android/gradle.properties"
+          fi
+          chmod +x "$PROJECT_DIR/android/gradlew"
+
+          flutter doctor -v > "$LOG_DIR/flutter-doctor.txt" 2>&1 || true
+
+          # IMPORTANT: pub get must run from the detected Flutter project root.
+          cd "$PROJECT_DIR"
+          test -f pubspec.yaml
+          test -f lib/main.dart
+          flutter pub get 2>&1 | tee "$LOG_DIR/flutter-pub-get.txt"
+
+          python3 "$PROJECT_DIR/tool/prepare_android.py" "$PROJECT_DIR" 2>&1 | tee "$LOG_DIR/android-identity-signing.txt"
+
+          grep -R "mk.kadkhodai.zarbu" "$PROJECT_DIR/android/app" > "$LOG_DIR/package-id-verification.txt"
+
+      - name: Analyze Flutter source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$LOG_DIR/04-flutter-analyze.log") 2>&1
+          cd "$PROJECT_DIR"
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Run Flutter tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$LOG_DIR/04b-flutter-test.log") 2>&1
+          cd "$PROJECT_DIR"
+          flutter test --no-pub --reporter expanded
+
+          # Exercise the exactly-once purchase ledger in both configured store modes
+          # without invoking any platform checkout method.
+          flutter test --no-pub --reporter expanded test/store_ledger_test.dart \
+            --dart-define=ZARBU_STORE=bazaar \
+            --dart-define=ZARBU_STORE_RSA=ci-public-key
+          flutter test --no-pub --reporter expanded test/store_ledger_test.dart \
+            --dart-define=ZARBU_STORE=myket \
+            --dart-define=ZARBU_STORE_RSA=ci-public-key
+
+      - name: Build final APK variants
+        id: build
+        shell: bash
+        env:
+          ZARBU_BAZAAR_RSA_KEY: ${{ secrets.ZARBU_BAZAAR_RSA_KEY }}
+          ZARBU_MYKET_RSA_KEY: ${{ secrets.ZARBU_MYKET_RSA_KEY }}
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$LOG_DIR/05-flutter-build.log") 2>&1
+
+          cd "$PROJECT_DIR"
+          rm -rf build "$OUTPUT_DIR"/*
+          mkdir -p "$OUTPUT_DIR/symbols/offline" "$OUTPUT_DIR/symbols/bazaar" "$OUTPUT_DIR/symbols/myket"
+
+          build_variant() {
+            local store="$1"
+            local rsa_key="$2"
+            local output_name="$3"
+            local symbol_dir="$4"
+
+            echo "=== Building store=$store -> $output_name ==="
+            rm -rf build/app/outputs/flutter-apk
+            if [[ "$store" == "offline" ]]; then
+              flutter build apk --release --no-pub --obfuscate --split-debug-info="$symbol_dir" \
+                --dart-define=ZARBU_STORE=offline
+            else
+              flutter build apk --release --no-pub --obfuscate --split-debug-info="$symbol_dir" \
+                --dart-define=ZARBU_STORE="$store" \
+                --dart-define=ZARBU_STORE_RSA="$rsa_key"
+            fi
+
+            local built_apk="$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk"
+            if [[ ! -s "$built_apk" ]]; then
+              echo "ERROR: Flutter completed without producing app-release.apk for $store." >&2
+              exit 50
+            fi
+            cp "$built_apk" "$OUTPUT_DIR/$output_name"
+          }
+
+          # Offline APK is always produced and contains no live payment entry point.
+          build_variant "offline" "" "ZARBU-offline-release.apk" "$OUTPUT_DIR/symbols/offline"
+
+          if [[ -n "${ZARBU_BAZAAR_RSA_KEY// }" ]]; then
+            build_variant "bazaar" "$ZARBU_BAZAAR_RSA_KEY" "ZARBU-bazaar-release.apk" "$OUTPUT_DIR/symbols/bazaar"
+            echo "Bazaar build: enabled" | tee "$LOG_DIR/bazaar-build-status.txt"
+          else
+            echo "Bazaar build: skipped (secret ZARBU_BAZAAR_RSA_KEY is not configured)" | tee "$LOG_DIR/bazaar-build-status.txt"
+          fi
+
+          if [[ -n "${ZARBU_MYKET_RSA_KEY// }" ]]; then
+            build_variant "myket" "$ZARBU_MYKET_RSA_KEY" "ZARBU-myket-release.apk" "$OUTPUT_DIR/symbols/myket"
+            echo "Myket build: enabled" | tee "$LOG_DIR/myket-build-status.txt"
+          else
+            echo "Myket build: skipped (secret ZARBU_MYKET_RSA_KEY is not configured)" | tee "$LOG_DIR/myket-build-status.txt"
+          fi
+
+          mapfile -t apks < <(find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.apk' -print | sort)
+          if (( ${#apks[@]} < 1 || ${#apks[@]} > 3 )); then
+            echo "ERROR: Expected 1..3 final APKs, found ${#apks[@]}." >&2
+            exit 51
+          fi
+
+          APKANALYZER="$(command -v apkanalyzer || true)"
+          AAPT="$(command -v aapt || true)"
+          APKSIGNER="$(command -v apksigner || true)"
+          if [[ -z "$APKANALYZER" && -n "${ANDROID_HOME:-}" ]]; then
+            APKANALYZER="$(find "$ANDROID_HOME" -type f -name apkanalyzer -perm -111 2>/dev/null | head -1 || true)"
+          fi
+          if [[ -z "$AAPT" && -n "${ANDROID_HOME:-}" ]]; then
+            AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt -perm -111 2>/dev/null | sort -V | tail -1 || true)"
+          fi
+          if [[ -z "$APKSIGNER" && -n "${ANDROID_HOME:-}" ]]; then
+            APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner -perm -111 2>/dev/null | sort -V | tail -1 || true)"
+          fi
+
+          : > "$LOG_DIR/apk.sha256"
+          : > "$LOG_DIR/apk-package-id.txt"
+          : > "$LOG_DIR/apk-size-gate.txt"
+          for apk in "${apks[@]}"; do
+            sha256sum "$apk" | tee -a "$LOG_DIR/apk.sha256"
+            apk_bytes="$(stat -c %s "$apk")"
+            max_apk_bytes=$((90 * 1024 * 1024))
+            echo "$(basename "$apk"): $apk_bytes bytes (max $max_apk_bytes)" | tee -a "$LOG_DIR/apk-size-gate.txt"
+            if (( apk_bytes > max_apk_bytes )); then
+              echo "ERROR: $(basename "$apk") exceeds 90 MiB." >&2
+              exit 54
+            fi
+
+            if [[ -n "$APKANALYZER" ]]; then
+              actual_package="$("$APKANALYZER" manifest application-id "$apk" | tr -d '\r')"
+            elif [[ -n "$AAPT" ]]; then
+              actual_package="$("$AAPT" dump badging "$apk" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1)"
+            else
+              echo "ERROR: Neither apkanalyzer nor aapt is available." >&2
+              exit 52
+            fi
+            echo "$(basename "$apk"): $actual_package" | tee -a "$LOG_DIR/apk-package-id.txt"
+            [[ "$actual_package" == "mk.kadkhodai.zarbu" ]] || { echo "ERROR: Unexpected applicationId: $actual_package" >&2; exit 53; }
+
+            if [[ -n "$APKSIGNER" ]]; then
+              "$APKSIGNER" verify --verbose --print-certs "$apk" >> "$LOG_DIR/apk-signature.txt"
+            else
+              jarsigner -verify "$apk" >> "$LOG_DIR/apk-signature.txt" 2>&1
+            fi
+          done
+
+          printf '%s\n' "${apks[@]}" > "$LOG_DIR/final-apks.txt"
+          echo "apk_glob=$OUTPUT_DIR/*.apk" >> "$GITHUB_OUTPUT"
+          echo "output_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload final APKs and obfuscation symbols
+        id: upload_apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            ${{ steps.build.outputs.apk_glob }}
+            ${{ steps.build.outputs.output_dir }}/symbols
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6
+
+      - name: Delete previous ZARBU APK artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP_ARTIFACT_ID: ${{ steps.upload_apk.outputs.artifact-id }}
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$LOG_DIR/06-artifact-cleanup.log") 2>&1
+
+          if [[ ! "$KEEP_ARTIFACT_ID" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Current artifact ID is invalid: $KEEP_ARTIFACT_ID" >&2
+            exit 60
+          fi
+
+          api="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts"
+          auth=(-H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28")
+
+          echo "Waiting for the newly uploaded artifact to become visible in the API..."
+          current_visible=0
+          for wait_try in 1 2 3 4 5 6 7 8 9 10; do
+            visibility_response="$(curl -fsS "${auth[@]}" "$api?per_page=100&page=1")"
+            current_visible="$(jq -r --arg keep "$KEEP_ARTIFACT_ID" '[.artifacts[] | select((.id|tostring) == $keep)] | length' <<< "$visibility_response")"
+            [[ "$current_visible" == "1" ]] && break
+            sleep 3
+          done
+          if [[ "$current_visible" != "1" ]]; then
+            echo "ERROR: The newly uploaded artifact is not visible through the GitHub API." >&2
+            exit 59
+          fi
+
+          delete_artifact() {
+            local id="$1"
+            local attempt
+            for attempt in 1 2 3; do
+              code="$(curl -sS -o "$RUNNER_TEMP/delete-artifact-${id}.txt" -w '%{http_code}' \
+                -X DELETE "${auth[@]}" "$api/$id" || true)"
+              if [[ "$code" == "204" || "$code" == "404" ]]; then
+                echo "Deleted previous artifact: $id"
+                return 0
+              fi
+              echo "Delete attempt $attempt failed for artifact $id (HTTP $code)."
+              sleep $((attempt * 2))
+            done
+            cat "$RUNNER_TEMP/delete-artifact-${id}.txt" 2>/dev/null || true
+            return 1
+          }
+
+          for pass in 1 2 3 4 5 6 7 8 9 10; do
+            response="$(curl -fsS "${auth[@]}" "$api?per_page=100&page=1")"
+            mapfile -t old_ids < <(jq -r --arg keep "$KEEP_ARTIFACT_ID" --arg name "$ARTIFACT_NAME" '.artifacts[] | select((.id|tostring) != $keep and .name == $name) | .id' <<< "$response")
+
+            if (( ${#old_ids[@]} == 0 )); then
+              break
+            fi
+
+            echo "Cleanup pass $pass: deleting ${#old_ids[@]} previous artifact(s)."
+            for id in "${old_ids[@]}"; do
+              delete_artifact "$id"
+            done
+          done
+
+          final_response=""
+          remaining_total=""
+          remaining_keep=""
+          for verify_try in 1 2 3 4 5; do
+            final_response="$(curl -fsS "${auth[@]}" "$api?per_page=100&page=1")"
+            remaining_total="$(jq -r --arg name "$ARTIFACT_NAME" '[.artifacts[] | select(.name == $name)] | length' <<< "$final_response")"
+            remaining_keep="$(jq -r --arg keep "$KEEP_ARTIFACT_ID" '[.artifacts[] | select((.id|tostring) == $keep)] | length' <<< "$final_response")"
+            [[ "$remaining_total" == "1" && "$remaining_keep" == "1" ]] && break
+            sleep 2
+          done
+
+          if [[ "$remaining_total" != "1" || "$remaining_keep" != "1" ]]; then
+            echo "ERROR: APK artifact cleanup verification failed. matching_name_count=$remaining_total keep_matches=$remaining_keep" >&2
+            jq '.artifacts[] | {id,name,created_at,expired}' <<< "$final_response" || true
+            exit 61
+          fi
+
+          echo "Only the current ZARBU APK artifact remains for this artifact name: $KEEP_ARTIFACT_ID"
+
+      - name: Publish success summary
+        if: success()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "## ✅ ZARBU final APK build completed"
+            echo ""
+            echo "- Source ZIP: \`${{ steps.source.outputs.source_zip }}\`"
+            echo "- Flutter project: \`${{ steps.detect.outputs.project_root }}\`"
+            echo "- Output artifact: \`$ARTIFACT_NAME\`"
+            echo "- APK files:"
+            while IFS= read -r apk; do echo "  - \`$(basename "$apk")\` — $(du -h "$apk" | awk '{print $1}')"; done < "$LOG_DIR/final-apks.txt"
+            echo "- Bazaar: $(cat "$LOG_DIR/bazaar-build-status.txt")"
+            echo "- Myket: $(cat "$LOG_DIR/myket-build-status.txt")"
+            echo "- Source release gate: passed"
+            echo "- Previous ZARBU final artifacts: deleted (diagnostics preserved)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect diagnostics after failure
+        id: diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          BUILD_ROOT="${BUILD_ROOT:-${RUNNER_TEMP}/zarbu-build}"
+          LOG_DIR="${LOG_DIR:-${BUILD_ROOT}/logs}"
+          DIAG_DIR="${DIAG_DIR:-${BUILD_ROOT}/diagnostics}"
+          PROJECT_DIR="${PROJECT_DIR:-${BUILD_ROOT}/project}"
+          mkdir -p "$LOG_DIR" "$DIAG_DIR"
+
+          cp -R "$LOG_DIR/." "$DIAG_DIR/" 2>/dev/null || true
+          {
+            echo "failed_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "source_zip=${SOURCE_ZIP:-not-selected}"
+            echo "project_dir=${PROJECT_DIR:-not-detected}"
+          } > "$DIAG_DIR/failure-summary.txt"
+
+          env | sort > "$DIAG_DIR/environment.txt"
+          df -h > "$DIAG_DIR/disk-usage.txt" 2>&1
+          free -h > "$DIAG_DIR/memory.txt" 2>&1
+          git status --short > "$DIAG_DIR/git-status.txt" 2>&1
+          git log -5 --oneline > "$DIAG_DIR/recent-commits.txt" 2>&1
+          java -version > "$DIAG_DIR/java-version.txt" 2>&1
+
+          if command -v flutter >/dev/null 2>&1; then
+            flutter --version > "$DIAG_DIR/flutter-version.txt" 2>&1
+            flutter doctor -v > "$DIAG_DIR/flutter-doctor-final.txt" 2>&1
+          fi
+
+          if [[ -d "${PROJECT_DIR:-}" ]]; then
+            cp "$PROJECT_DIR/pubspec.yaml" "$DIAG_DIR/pubspec.yaml" 2>/dev/null || true
+            cp "$PROJECT_DIR/pubspec.lock" "$DIAG_DIR/pubspec.lock" 2>/dev/null || true
+            cp "$PROJECT_DIR/analysis_options.yaml" "$DIAG_DIR/analysis_options.yaml" 2>/dev/null || true
+            find "$PROJECT_DIR" -maxdepth 5 -type f | sort > "$DIAG_DIR/project-files.txt" 2>&1
+            find "$PROJECT_DIR/android" -maxdepth 4 -type f \( \
+              -name '*.gradle' -o -name '*.gradle.kts' -o -name 'gradle.properties' -o -name 'gradle-wrapper.properties' \
+            \) -print -exec sh -c 'echo "----- $1"; sed -n "1,240p" "$1"' _ {} \; \
+              > "$DIAG_DIR/android-gradle-files.txt" 2>&1
+          fi
+
+          # GitHub Actions artifacts are downloaded as ZIP automatically.
+          # Upload the diagnostics directory directly to avoid ZIP-inside-ZIP.
+          test -d "$DIAG_DIR"
+          test -f "$DIAG_DIR/failure-summary.txt"
+          echo "diagnostics_dir=$DIAG_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload error logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ERROR_ARTIFACT_NAME }}
+          path: ${{ steps.diagnostics.outputs.diagnostics_dir }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
